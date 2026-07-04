@@ -1,0 +1,23 @@
+# Narsil configuration file
+# Copy to ids.conf and edit as needed.
+# Lines starting with # are comments.
+
+# --- Logging ---
+# log_path ids_alerts.jsonl
+
+# --- Monitor toggles (live mode) ---
+# monitor_network   yes
+# monitor_processes yes
+# monitor_events    yes
+
+# --- Blocked IPs (live mode: alert on any connection) ---
+# blocked_ip 10.0.0.1
+# blocked_ip 192.168.1.100
+
+# --- Suspicious ports (live mode: alert on connection to these ports) ---
+# suspicious_port 4444
+# suspicious_port 1337
+# suspicious_port 31337
+
+# --- Verbose output ---
+# verbose no
