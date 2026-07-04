@@ -155,13 +155,13 @@ int main(int argc, char *argv[]) {
     /* -----------------------------------------------
        Scan modules — sequential, no threads
        ----------------------------------------------- */
-    ids_scan_kernel     (cfg, rep);
-    ids_scan_rootkit    (cfg, rep);
-    ids_scan_persistence(cfg, rep);
-    ids_scan_processes  (cfg, rep, yara_rules);
-    ids_scan_memory     (cfg, rep, yara_rules);
-    ids_scan_network    (cfg, rep);
-    ids_scan_events     (cfg, rep);
+    if (cfg->scan_kernel)      ids_scan_kernel     (cfg, rep);
+    if (cfg->scan_rootkit)     ids_scan_rootkit    (cfg, rep);
+    if (cfg->scan_persistence) ids_scan_persistence(cfg, rep);
+    if (cfg->scan_processes)   ids_scan_processes  (cfg, rep, yara_rules);
+    if (cfg->scan_memory)      ids_scan_memory     (cfg, rep, yara_rules);
+    if (cfg->scan_network)     ids_scan_network    (cfg, rep);
+    if (cfg->scan_events)      ids_scan_events     (cfg, rep);
 
     report_write(rep, cfg);
     report_free(rep);

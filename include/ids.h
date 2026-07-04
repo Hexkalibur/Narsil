@@ -139,6 +139,15 @@ typedef struct {
     WORD    suspicious_ports[MAX_SUSPICIOUS_PORTS];
     int     suspicious_port_count;
     BOOL    verbose;
+    /* Per-module scan toggles (default TRUE). Let the operator skip
+       slow or noisy modules from the config file. */
+    BOOL    scan_kernel;
+    BOOL    scan_rootkit;
+    BOOL    scan_persistence;
+    BOOL    scan_processes;
+    BOOL    scan_memory;
+    BOOL    scan_network;
+    BOOL    scan_events;
     SRWLOCK config_lock;
 } IdsConfig;
 

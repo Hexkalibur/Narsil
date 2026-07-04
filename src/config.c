@@ -1,17 +1,24 @@
 /*
- * config.c  --  IDS configuration: create defaults, load from file, free.
+ * config.c  --  Narsil configuration: create defaults, load from file, free.
  *
  * Config file format (plain text, one directive per line):
  *
- *   block_ip   <ip>
- *   bad_port   <port>
- *   verbose
- *   no_network
- *   no_process
- *   no_events
- *   log        <path>
+ *   log_path        <path>     alert JSONL log destination
+ *   blocked_ip      <ip>       flag any connection to/from this IP
+ *   suspicious_port <port>     flag any endpoint on this port
+ *   verbose                    enable debug output
  *
- * Lines starting with '#' are comments.
+ *   # Module toggles — skip a scan module entirely
+ *   no_kernel
+ *   no_rootkit
+ *   no_persistence
+ *   no_process
+ *   no_memory
+ *   no_network
+ *   no_events
+ *
+ * Lines starting with '#' are comments. Legacy directive aliases
+ * (log, block_ip, bad_port) are still accepted for compatibility.
  */
 #include "../include/ids.h"
 
@@ -34,10 +41,16 @@ IdsConfig *ids_config_create(void) {
     IdsConfig *cfg = (IdsConfig *)calloc(1, sizeof(IdsConfig));
     if (!cfg) return NULL;
 
-    cfg->monitor_network   = TRUE;
-    cfg->monitor_processes = TRUE;
-    cfg->monitor_events    = TRUE;
-    cfg->verbose           = FALSE;
+    cfg->verbose = FALSE;
+
+    /* Every scan module runs unless explicitly disabled. */
+    cfg->scan_kernel      = TRUE;
+    cfg->scan_rootkit     = TRUE;
+    cfg->scan_persistence = TRUE;
+    cfg->scan_processes   = TRUE;
+    cfg->scan_memory      = TRUE;
+    cfg->scan_network     = TRUE;
+    cfg->scan_events      = TRUE;
 
     InitializeSRWLock(&cfg->config_lock);
 
@@ -66,29 +79,51 @@ BOOL ids_config_load(IdsConfig *cfg, const char *path) {
         if (strcmp(key, "verbose") == 0) {
             cfg->verbose = TRUE;
 
-        } else if (strcmp(key, "no_network") == 0) {
-            cfg->monitor_network = FALSE;
-
+        } else if (strcmp(key, "no_kernel") == 0) {
+            cfg->scan_kernel = FALSE;
+        } else if (strcmp(key, "no_rootkit") == 0) {
+            cfg->scan_rootkit = FALSE;
+        } else if (strcmp(key, "no_persistence") == 0) {
+            cfg->scan_persistence = FALSE;
         } else if (strcmp(key, "no_process") == 0) {
-            cfg->monitor_processes = FALSE;
-
+            cfg->scan_processes = FALSE;
+        } else if (strcmp(key, "no_memory") == 0) {
+            cfg->scan_memory = FALSE;
+        } else if (strcmp(key, "no_network") == 0) {
+            cfg->scan_network = FALSE;
         } else if (strcmp(key, "no_events") == 0) {
-            cfg->monitor_events = FALSE;
+            cfg->scan_events = FALSE;
 
-        } else if (strcmp(key, "log") == 0 && fields == 2) {
+        } else if ((strcmp(key, "log_path") == 0 || strcmp(key, "log") == 0)
+                   && fields == 2) {
             strncpy(cfg->log_path, val, MAX_LOG_PATH - 1);
+            cfg->log_path[MAX_LOG_PATH - 1] = '\0';
 
-        } else if (strcmp(key, "block_ip") == 0 && fields == 2) {
-            if (cfg->blocked_ip_count < MAX_BLOCKED_IPS)
-                strncpy(cfg->blocked_ips[cfg->blocked_ip_count++],
-                        val, MAX_IP_LEN - 1);
+        } else if ((strcmp(key, "blocked_ip") == 0 || strcmp(key, "block_ip") == 0)
+                   && fields == 2) {
+            if (cfg->blocked_ip_count < MAX_BLOCKED_IPS) {
+                strncpy(cfg->blocked_ips[cfg->blocked_ip_count], val, MAX_IP_LEN - 1);
+                cfg->blocked_ips[cfg->blocked_ip_count][MAX_IP_LEN - 1] = '\0';
+                cfg->blocked_ip_count++;
+            } else {
+                LOG_WARN("config: blocked IP list full (%d), ignoring %s",
+                         MAX_BLOCKED_IPS, val);
+            }
 
-        } else if (strcmp(key, "bad_port") == 0 && fields == 2) {
+        } else if ((strcmp(key, "suspicious_port") == 0 || strcmp(key, "bad_port") == 0)
+                   && fields == 2) {
             int port = atoi(val);
-            if (port > 0 && port <= 65535 &&
-                cfg->suspicious_port_count < MAX_SUSPICIOUS_PORTS)
-                cfg->suspicious_ports[cfg->suspicious_port_count++] =
-                    (WORD)port;
+            if (port <= 0 || port > 65535) {
+                LOG_WARN("config: invalid port '%s' ignored", val);
+            } else if (cfg->suspicious_port_count < MAX_SUSPICIOUS_PORTS) {
+                cfg->suspicious_ports[cfg->suspicious_port_count++] = (WORD)port;
+            } else {
+                LOG_WARN("config: suspicious port list full (%d), ignoring %d",
+                         MAX_SUSPICIOUS_PORTS, port);
+            }
+
+        } else {
+            LOG_WARN("config: unknown directive '%s' ignored", key);
         }
     }
 
@@ -98,7 +133,6 @@ BOOL ids_config_load(IdsConfig *cfg, const char *path) {
 
 void ids_config_free(IdsConfig *cfg) {
     if (!cfg) return;
-    free(cfg->rules);
     SecureZeroMemory(cfg, sizeof(IdsConfig));   /* wipe sensitive data */
     free(cfg);
 }
