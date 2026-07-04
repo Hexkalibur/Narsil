@@ -1,7 +1,7 @@
 # Narsil
 
 <p align="center">
-  <img src="01.jpg" alt="Narsil" width="100">
+  <img src="01.png" alt="Narsil" width="100">
 </p>
 
 ![Makefile CI](https://github.com/Hexkalibur/Narsil/actions/workflows/makefile.yml/badge.svg)
