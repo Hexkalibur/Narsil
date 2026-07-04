@@ -1,0 +1,29 @@
+name: Makefile CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install MinGW-w64 cross-compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-mingw-w64-x86-64
+
+    - name: Build narsil.exe
+      run: make CC=x86_64-w64-mingw32-gcc
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: narsil-exe
+        path: narsil.exe
+        if-no-files-found: error

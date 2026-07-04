@@ -1,0 +1,32 @@
+# Narsil configuration file
+# Copy to ids.conf and pass with -c ids.conf
+# Lines starting with # are comments.
+
+# --- Logging ---
+# Destination for the live alert JSONL log.
+# log_path ids_alerts.jsonl
+
+# --- Blocked IPs ---
+# Flag any connection to/from these addresses.
+# blocked_ip 10.0.0.1
+# blocked_ip 192.168.1.100
+
+# --- Suspicious ports ---
+# Flag any endpoint (TCP/UDP) on these ports, in addition to the
+# built-in defaults (4444, 1337, 31337, IRC/RAT ports, ...).
+# suspicious_port 4444
+# suspicious_port 1337
+# suspicious_port 31337
+
+# --- Module toggles ---
+# Skip individual scan modules (all run by default).
+# no_kernel
+# no_rootkit
+# no_persistence
+# no_process
+# no_memory
+# no_network
+# no_events
+
+# --- Verbose / debug output ---
+# verbose
