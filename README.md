@@ -6,6 +6,11 @@
 
 ![Makefile CI](https://github.com/Hexkalibur/Narsil/actions/workflows/makefile.yml/badge.svg)
 
+
+
+## The project is still in its initial phase and needs several improvements!!
+
+
 A Windows security scanner. Narsil answers one question:
 *"Is my machine compromised right now?"* It runs a deep, one-shot analysis
 of the system using native Windows APIs only, with no heavy external
