@@ -72,6 +72,10 @@ static void resolve_ntqit(void) {
     if (ntdll)
         g_NtQIT = (PFN_NtQueryInformationThread)(void *)
                   GetProcAddress(ntdll, "NtQueryInformationThread");
+    if (!g_NtQIT)
+        LOG_WARN("memory: NtQueryInformationThread unavailable -- "
+                 "thread-start correlation (injected-thread detection) "
+                 "disabled for this run");
 }
 
 /* Collect the Win32 start addresses of every thread in pid. */
