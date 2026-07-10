@@ -158,11 +158,11 @@ typedef struct {
 
 /* Scan one process's address space (hp already opened by the caller).
    Fills *mf with what was found. */
-static void scan_process_memory(DWORD pid, HANDLE hp, MemFindings *mf) {
+static void scan_process_memory(DWORD pid, HANDLE hp, MemFindings *mf, BOOL strict) {
     memset(mf, 0, sizeof(*mf));
 
     ULONG_PTR starts[MAX_THREAD_STARTS];
-    int n_starts = collect_thread_starts(pid, starts, MAX_THREAD_STARTS);
+    int n_starts = strict ? 0 : collect_thread_starts(pid, starts, MAX_THREAD_STARTS);
 
     MEMORY_BASIC_INFORMATION mbi;
     unsigned char *addr = 0;
@@ -186,13 +186,13 @@ static void scan_process_memory(DWORD pid, HANDLE hp, MemFindings *mf) {
 
             if (prot_is_wx(mbi.Protect)) mf->rwx++;
 
-            if (!mf->pe_found &&
+            if (!strict && !mf->pe_found &&
                 region_has_pe(hp, (unsigned char *)mbi.BaseAddress, mbi.RegionSize)) {
                 mf->pe_found = TRUE;
                 mf->pe_addr  = (ULONG_PTR)mbi.BaseAddress;
             }
 
-            if (!mf->thread_in_priv) {
+            if (!strict && !mf->thread_in_priv) {
                 ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
                 ULONG_PTR end  = base + mbi.RegionSize;
                 for (int i = 0; i < n_starts; i++) {
@@ -242,7 +242,7 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
             if (!hp) { denied++; continue; }
 
             MemFindings mf;
-            scan_process_memory(pid, hp, &mf);
+            scan_process_memory(pid, hp, &mf, cfg->memory_strict);
             scanned++;
 
             if (mf.priv_exec == 0) { CloseHandle(hp); continue; }
@@ -366,4 +366,3 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
     LOG_INFO("scan: memory -- done  total=%d  scanned=%d  denied=%d  flagged=%d",
              total, scanned, denied, flagged);
 }
-
