@@ -16,8 +16,8 @@
 #include "../include/ids.h"
 #include "../include/report.h"
 
-/* How far back to look */
-#define SCAN_HOURS_BACK    24
+/* Default lookback if the operator doesn't override events_hours in the
+   config file (see cfg->events_hours_back, default 24). */
 #define BRUTE_THRESHOLD     5    /* failed logons within window = brute force */
 #define BRUTE_WINDOW_SECS 300    /* 5 minutes */
 #define MAX_EVENTS_READ   4096
@@ -32,6 +32,10 @@
 #define EVT_SERVICE_INSTALLED 7045
 #define EVT_LOG_CLEARED_SEC   1102
 #define EVT_LOG_CLEARED_SYS    104
+
+/* Microsoft-Windows-Windows Defender/Operational channel */
+#define EVT_DEFENDER_DETECTION 1116
+#define EVT_DEFENDER_ACTION_FAIL 1119
 
 /* -----------------------------------------------
    Minimal XML field extractor
@@ -214,17 +218,36 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
             break;
         }
 
-        case EVT_PROCESS_CREATION:
-            a.severity = SEV_LOW;
+        case EVT_PROCESS_CREATION: {
+            /* Command-line auditing must be enabled via GPO for this field
+               to be populated; if absent we still get the image name. */
+            char cmdline[512] = {0};
+            xml_extract_data(xml, "CommandLine", cmdline, sizeof(cmdline));
+
+            const NarsilPattern *m = narsil_match_pattern(cmdline[0] ? cmdline : proc_name);
             strncpy(a.process_name, proc_name, MAX_PATH - 1);
+
+            if (m) {
+                a.type     = ALERT_SUSPICIOUS_CMDLINE;
+                a.severity = m->sev;
+                strncpy(a.technique_id, m->mitre, sizeof(a.technique_id) - 1);
+                snprintf(a.description, MAX_DESCRIPTION,
+                         "%s: process created (4688) name=%s user=%s cmdline: %.150s",
+                         m->why, proc_name[0] ? proc_name : "?",
+                         username[0] ? username : "?", cmdline);
+                break;
+            }
+
+            /* No suspicious pattern -- low severity, evidence only. */
+            a.severity = SEV_LOW;
             snprintf(a.description, MAX_DESCRIPTION,
                      "Process created (4688) name=%s user=%s",
                      proc_name[0] ? proc_name : "?",
                      username[0]  ? username  : "?");
-            /* Low severity — only add to evidence, don't alert */
             report_table_add(tbl, proc_name, proc_name, ev_label, ENTRY_OK,
                              username[0] ? username : "");
             return;
+        }
 
         case EVT_LOG_CLEARED_SEC:
         case EVT_LOG_CLEARED_SYS:
@@ -233,6 +256,29 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
                      "Event log cleared (EventID=%lu) by %s -- anti-forensic indicator",
                      eid, username[0] ? username : "?");
             strncpy(a.technique_id, "T1070", sizeof(a.technique_id) - 1);
+            break;
+
+        case EVT_DEFENDER_DETECTION: {
+            char threat[256] = {0}, path[MAX_PATH] = {0};
+            xml_extract_data(xml, "Threat Name", threat, sizeof(threat));
+            xml_extract_data(xml, "Path",        path,   sizeof(path));
+            a.type     = ALERT_DEFENDER_EVENT;
+            a.severity = SEV_CRITICAL;
+            if (path[0]) strncpy(a.file_path, path, MAX_PATH - 1);
+            snprintf(a.description, MAX_DESCRIPTION,
+                     "Windows Defender detection (1116): %s%s%s -- Narsil's own "
+                     "process/memory findings should be cross-checked against this",
+                     threat[0] ? threat : "unknown threat",
+                     path[0] ? " @ " : "", path);
+            break;
+        }
+
+        case EVT_DEFENDER_ACTION_FAIL:
+            a.type     = ALERT_DEFENDER_EVENT;
+            a.severity = SEV_HIGH;
+            snprintf(a.description, MAX_DESCRIPTION,
+                     "Windows Defender remediation FAILED (1119) -- threat may still "
+                     "be active on this host");
             break;
 
         default:
@@ -250,10 +296,10 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
    Query one channel for the last N hours
    ----------------------------------------------- */
 static void query_channel(IdsConfig *cfg, ScanReport *rep,
-                           EvidenceTable *tbl, const wchar_t *channel) {
+                           EvidenceTable *tbl, const wchar_t *channel,
+                           int hours_back) {
 
-    /* XPath: events from the last SCAN_HOURS_BACK hours */
-    ULONGLONG ms = (ULONGLONG)SCAN_HOURS_BACK * 3600 * 1000;
+    ULONGLONG ms = (ULONGLONG)hours_back * 3600 * 1000;
     wchar_t xpath[256];
     swprintf(xpath, 256,
              L"Event/System[TimeCreated[timediff(@SystemTime) <= %I64u]]",
@@ -288,12 +334,15 @@ static void query_channel(IdsConfig *cfg, ScanReport *rep,
    Public entry point
    ----------------------------------------------- */
 void ids_scan_events(IdsConfig *cfg, ScanReport *rep) {
-    LOG_INFO("scan: event logs (last %d hours)...", SCAN_HOURS_BACK);
+    int hours = cfg->events_hours_back > 0 ? cfg->events_hours_back : 24;
+    LOG_INFO("scan: event logs (last %d hours)...", hours);
 
     EvidenceTable *tbl = report_table_begin(rep, "events");
 
-    query_channel(cfg, rep, tbl, L"Security");
-    query_channel(cfg, rep, tbl, L"System");
+    query_channel(cfg, rep, tbl, L"Security", hours);
+    query_channel(cfg, rep, tbl, L"System", hours);
+    query_channel(cfg, rep, tbl,
+                  L"Microsoft-Windows-Windows Defender/Operational", hours);
 
     LOG_INFO("scan: events -- done  processed=%d  flagged=%d",
              tbl->count, tbl->flagged_count);

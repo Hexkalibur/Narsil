@@ -18,7 +18,8 @@ SRCS = src/main.c        \
        src/kernel.c      \
        src/rootkit.c     \
        src/persistence.c \
-       src/memory.c
+       src/memory.c      \
+       src/util.c
 
 TARGET = narsil.exe
 

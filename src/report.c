@@ -49,6 +49,7 @@ void report_free(ScanReport *r) { if (r) free(r); }
    ----------------------------------------------- */
 void report_add(ScanReport *r, const Alert *a) {
     if (!r || !a) return;
+    if (g_active_cfg && ids_alert_suppressed(g_active_cfg, a)) return;
     if (r->count >= REPORT_MAX_ALERTS) {
         LOG_WARN("report_add: buffer full (%d), dropping alert", REPORT_MAX_ALERTS);
         return;

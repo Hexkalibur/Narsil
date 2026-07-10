@@ -17,9 +17,6 @@
  */
 #include "../include/ids.h"
 #include "../include/report.h"
-#include <wintrust.h>
-#include <softpub.h>
-#include <mscat.h>
 
 /* -----------------------------------------------
    Known-good driver locations (lowercase for comparison)
@@ -102,112 +99,8 @@ static void resolve_path(const char *kpath, char *out, size_t out_len) {
     }
 }
 
-/* -----------------------------------------------
-   Signature verification
-   ----------------------------------------------- */
-typedef enum { SIG_VALID, SIG_UNSIGNED, SIG_INVALID } SigStatus;
-
-/* Catalog check: hash file and look it up in the system driver catalog */
-static BOOL is_catalog_signed(const char *path) {
-    wchar_t wpath[MAX_PATH] = {0};
-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH))
-        return FALSE;
-
-    HANDLE hFile = CreateFileW(wpath, GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        LOG_DBG("kernel: catalog_open failed: %s (err=%lu)", path, GetLastError());
-        return FALSE;
-    }
-
-    HCATADMIN hAdmin = NULL;
-    GUID action = DRIVER_ACTION_VERIFY;
-    if (!CryptCATAdminAcquireContext(&hAdmin, &action, 0)) {
-        LOG_DBG("kernel: CryptCATAdminAcquireContext failed (err=%lu)", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    /* First call: get required hash length */
-    DWORD hashLen = 0;
-    CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, NULL, 0);
-
-    BOOL found = FALSE;
-    if (hashLen > 0) {
-        BYTE *hash = (BYTE *)malloc(hashLen);
-        if (hash) {
-            if (CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hash, 0)) {
-                HCATINFO hInfo = CryptCATAdminEnumCatalogFromHash(
-                                     hAdmin, hash, hashLen, 0, NULL);
-                if (hInfo) {
-                    found = TRUE;
-                    CryptCATAdminReleaseCatalogContext(hAdmin, hInfo, 0);
-                }
-            } else {
-                LOG_DBG("kernel: CalcHash failed: %s (err=%lu)", path, GetLastError());
-            }
-            free(hash);
-        }
-    } else {
-        LOG_DBG("kernel: hashLen=0 for %s", path);
-    }
-
-    CloseHandle(hFile);
-    CryptCATAdminReleaseContext(hAdmin, 0);
-    LOG_DBG("kernel: catalog(%s) -> %s", path, found ? "SIGNED" : "NOT FOUND");
-    return found;
-}
-
-/* Full verification: embedded PE sig first, catalog fallback */
-static SigStatus sig_verify(const char *path) {
-    wchar_t wpath[MAX_PATH] = {0};
-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH)) {
-        LOG_WARN("kernel: MultiByteToWideChar failed: %s (err=%lu)", path, GetLastError());
-        return SIG_INVALID;
-    }
-
-    WINTRUST_FILE_INFO fi;
-    memset(&fi, 0, sizeof(fi));
-    fi.cbStruct      = sizeof(fi);
-    fi.pcwszFilePath = wpath;
-
-    WINTRUST_DATA wd;
-    memset(&wd, 0, sizeof(wd));
-    wd.cbStruct            = sizeof(wd);
-    wd.dwUnionChoice       = WTD_CHOICE_FILE;
-    wd.pFile               = &fi;
-    wd.dwUIChoice          = WTD_UI_NONE;
-    wd.fdwRevocationChecks = WTD_REVOKE_NONE;   /* no network round-trips */
-    wd.dwStateAction       = WTD_STATEACTION_VERIFY;
-    wd.dwProvFlags         = WTD_SAFER_FLAG;
-
-    GUID guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    LONG rc   = WinVerifyTrust(NULL, &guid, &wd);
-
-    /* Always release WinVerifyTrust resources */
-    wd.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(NULL, &guid, &wd);
-
-    if (rc == ERROR_SUCCESS) {
-        LOG_DBG("kernel: sig(%s) EMBEDDED OK", path);
-        return SIG_VALID;
-    }
-
-    if (rc == TRUST_E_NOSIGNATURE) {
-        /* No embedded sig — try system catalog (standard for inbox drivers) */
-        if (is_catalog_signed(path)) {
-            LOG_DBG("kernel: sig(%s) CATALOG OK", path);
-            return SIG_VALID;
-        }
-        LOG_DBG("kernel: sig(%s) UNSIGNED", path);
-        return SIG_UNSIGNED;
-    }
-
-    /* Any other error = tampered / invalid chain */
-    LOG_DBG("kernel: sig(%s) INVALID rc=0x%lx", path, (unsigned long)rc);
-    return SIG_INVALID;
-}
+/* Signature verification (embedded PE sig + catalog fallback) is shared
+   with process.c/persistence.c via narsil_sig_verify() in util.c. */
 
 /* -----------------------------------------------
    Emit a driver alert to both report and live log.
@@ -313,18 +206,16 @@ void ids_scan_kernel(IdsConfig *cfg, ScanReport *rep) {
         }
 
         /* Signature check */
-        SigStatus sig  = sig_verify(w32path);
-        const char *sig_str = (sig == SIG_VALID)    ? "signed (embedded or catalog)" :
-                              (sig == SIG_UNSIGNED)  ? "unsigned" :
-                                                       "tampered";
+        NarsilSig sig  = narsil_sig_verify(w32path);
+        const char *sig_str = narsil_sig_str(sig);
 
-        if (sig == SIG_UNSIGNED) {
+        if (sig == NSIG_UNSIGNED) {
             emit_alert(cfg, rep, SEV_HIGH, w32path,
                 "Unsigned driver: %s", w32path);
             report_table_add(tbl, w32path, base_name, sig_str,
                              ENTRY_FLAGGED, "no valid signature found");
             flagged++;
-        } else if (sig == SIG_INVALID) {
+        } else if (sig == NSIG_INVALID) {
             emit_alert(cfg, rep, SEV_CRITICAL, w32path,
                 "Tampered driver (invalid signature): %s", w32path);
             report_table_add(tbl, w32path, base_name, sig_str,

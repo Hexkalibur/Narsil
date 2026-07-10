@@ -3,17 +3,16 @@
  *
  * For every running process, checks:
  *   1. Name against known-bad list (tier 1)
- *   2. Executable path — staging directories (tier 2)
- *   3. Authenticode signature (tier 3)
- *   4. Parent-child anomalies (Office/browser -> shell)
- *   5. Integrity level (LOW = sandboxed/suspicious if not browser)
+ *   2. Command line against the suspicious pattern table (tier 2, v0.2)
+ *   3. Parent-child anomalies (Office/browser -> shell) (tier 3)
+ *   4. Executable path — staging directories (tier 4)
+ *   5. Authenticode signature (tier 5)
+ *   6. Integrity level (LOW = sandboxed/suspicious if not browser)
  *
  * No threads. Called once by run_scan, returns.
  */
 #include "../include/ids.h"
 #include "../include/report.h"
-#include <wintrust.h>
-#include <softpub.h>
 
 /* -----------------------------------------------
    Tier 1 — known-bad process names
@@ -47,58 +46,6 @@ static const ParentChildRule PC_RULES[] = {
     { NULL, NULL, 0, NULL }
 };
 
-/* Staging paths */
-static const char *STAGING[] = {
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\downloads\\", "\\desktop\\", "\\public\\",
-    NULL
-};
-
-/* -----------------------------------------------
-   Authenticode signature cache
-   ----------------------------------------------- */
-#define SIG_CACHE_CAP 512
-typedef enum { SIG_VALID, SIG_UNSIGNED, SIG_INVALID } SigStatus;
-typedef struct { char path[MAX_PATH]; SigStatus status; } SigCacheEntry;
-static SigCacheEntry g_sig[SIG_CACHE_CAP];
-static int           g_sig_n = 0;
-
-static SigStatus sig_verify(const char *path) {
-    /* Cache lookup */
-    for (int i = 0; i < g_sig_n; i++)
-        if (_stricmp(g_sig[i].path, path) == 0) return g_sig[i].status;
-
-    wchar_t wp[MAX_PATH] = {0};
-    MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH);
-
-    WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof(fi));
-    fi.cbStruct = sizeof(fi); fi.pcwszFilePath = wp;
-
-    WINTRUST_DATA wd; memset(&wd, 0, sizeof(wd));
-    wd.cbStruct            = sizeof(wd);
-    wd.dwUnionChoice       = WTD_CHOICE_FILE;
-    wd.pFile               = &fi;
-    wd.dwUIChoice          = WTD_UI_NONE;
-    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
-    wd.dwStateAction       = WTD_STATEACTION_VERIFY;
-    wd.dwProvFlags         = WTD_SAFER_FLAG;
-
-    GUID guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    LONG rc   = WinVerifyTrust(NULL, &guid, &wd);
-    wd.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(NULL, &guid, &wd);
-
-    SigStatus s = (rc == ERROR_SUCCESS)       ? SIG_VALID   :
-                  (rc == TRUST_E_NOSIGNATURE)  ? SIG_UNSIGNED:
-                                                 SIG_INVALID;
-    if (g_sig_n < SIG_CACHE_CAP) {
-        strncpy(g_sig[g_sig_n].path, path, MAX_PATH - 1);
-        g_sig[g_sig_n].status = s;
-        g_sig_n++;
-    }
-    return s;
-}
-
 /* -----------------------------------------------
    Integrity level of a process
    ----------------------------------------------- */
@@ -128,25 +75,6 @@ static const char *get_integrity(DWORD pid) {
 /* -----------------------------------------------
    Helpers
    ----------------------------------------------- */
-static BOOL is_staging(const char *path) {
-    char low[MAX_PATH];
-    size_t len = strlen(path);
-    if (len >= MAX_PATH) len = MAX_PATH - 1;
-    memcpy(low, path, len); low[len] = '\0';
-    for (char *p = low; *p; p++) *p = (char)tolower((unsigned char)*p);
-    for (int i = 0; STAGING[i]; i++)
-        if (strstr(low, STAGING[i])) return TRUE;
-    return FALSE;
-}
-
-static void get_exe_path(DWORD pid, char *out, DWORD out_sz) {
-    out[0] = '\0';
-    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hp) return;
-    QueryFullProcessImageNameA(hp, 0, out, &out_sz);
-    CloseHandle(hp);
-}
-
 static void get_parent_name(DWORD parent_pid, char *out) {
     out[0] = '\0';
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -229,7 +157,7 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
             continue;
         }
 
-        get_exe_path(pid, path, MAX_PATH);
+        narsil_get_exe_path(pid, path, MAX_PATH);
         get_parent_name(pe.th32ParentProcessID, parent_name);
 
         /* Lowercase name for comparison */
@@ -254,7 +182,23 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
         }
         if (bad) continue;
 
-        /* Tier 2 — parent-child anomaly */
+        /* Tier 2 — command-line pattern match (v0.2). Cross-process
+           command-line retrieval is best-effort (see narsil_get_cmdline);
+           silently skipped if the PEB read fails. */
+        char cmdline[512] = {0};
+        if (narsil_get_cmdline(pid, cmdline, sizeof(cmdline))) {
+            const NarsilPattern *m = narsil_match_pattern(cmdline);
+            if (m) {
+                emit(cfg, rep, tbl, ALERT_SUSPICIOUS_CMDLINE, m->sev,
+                     pid, name, path, m->mitre, ENTRY_FLAGGED,
+                     "%s: %s (pid=%lu) cmdline: %.200s",
+                     m->why, name, pid, cmdline);
+                bad = TRUE; flagged++;
+            }
+        }
+        if (bad) continue;
+
+        /* Tier 3 — parent-child anomaly */
         char lower_parent[MAX_PATH] = {0};
         strncpy(lower_parent, parent_name, MAX_PATH - 1);
         for (char *p = lower_parent; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -272,25 +216,23 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
         }
         if (bad) continue;
 
-        /* Tier 3 — staging path */
-        if (path[0] && is_staging(path)) {
-            SigStatus sig = sig_verify(path);
-            Severity  sev = (sig == SIG_INVALID)  ? SEV_CRITICAL :
-                            (sig == SIG_UNSIGNED)  ? SEV_HIGH     : SEV_MEDIUM;
-            const char *sig_str = (sig == SIG_VALID)   ? "signed"   :
-                                  (sig == SIG_UNSIGNED) ? "unsigned" : "tampered";
+        /* Tier 4 — staging path */
+        if (path[0] && narsil_is_staging_path(path)) {
+            NarsilSig sig = narsil_sig_verify(path);
+            Severity  sev = (sig == NSIG_INVALID)  ? SEV_CRITICAL :
+                            (sig == NSIG_UNSIGNED)  ? SEV_HIGH     : SEV_MEDIUM;
             emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, sev,
                  pid, name, path, "T1059", ENTRY_FLAGGED,
                  "Process in staging path (%s sig): %.64s  integrity=%s",
-                 sig_str, path, get_integrity(pid));
+                 narsil_sig_str(sig), path, get_integrity(pid));
             flagged++;
             continue;
         }
 
-        /* Tier 4 — unsigned binary outside staging (lower severity) */
+        /* Tier 5 — unsigned binary outside staging (lower severity) */
         if (path[0]) {
-            SigStatus sig = sig_verify(path);
-            if (sig == SIG_INVALID) {
+            NarsilSig sig = narsil_sig_verify(path);
+            if (sig == NSIG_INVALID) {
                 emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, SEV_HIGH,
                      pid, name, path, "T1036", ENTRY_FLAGGED,
                      "Tampered binary: %.64s  integrity=%s",
@@ -298,8 +240,8 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
                 flagged++;
                 continue;
             }
-            const char *sig_str = (sig == SIG_VALID) ? "signed (embedded/catalog)"
-                                                      : "unsigned";
+            const char *sig_str = (sig == NSIG_VALID) ? "signed (embedded/catalog)"
+                                                        : "unsigned";
             report_table_add(tbl, path, name, sig_str, ENTRY_OK, "");
         } else {
             report_table_add(tbl, "", name, "path unavailable", ENTRY_OK, "");

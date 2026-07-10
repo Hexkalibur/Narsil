@@ -7,9 +7,11 @@
 # log_path ids_alerts.jsonl
 
 # --- Blocked IPs ---
-# Flag any connection to/from these addresses.
+# Flag any connection to/from these addresses. CIDR ranges are supported
+# (v0.2) for blocking whole netblocks in one directive.
 # blocked_ip 10.0.0.1
 # blocked_ip 192.168.1.100
+# blocked_ip 45.146.164.0/24
 
 # --- Suspicious ports ---
 # Flag any endpoint (TCP/UDP) on these ports, in addition to the
@@ -27,6 +29,39 @@
 # no_memory
 # no_network
 # no_events
+
+# --- v0.2: memory scan noise control ---
+# By default Narsil triages RWX findings (mapped-PE / thread-entry
+# correlation) instead of alerting on every RWX region like v0.1 did.
+# Add extra processes here that legitimately JIT/allocate RWX memory on
+# your fleet (the common browsers, .NET host, and Defender are already
+# built in) so plain RWX findings in them are recorded as evidence, not
+# alerts, unless a mapped PE or a suspicious thread entry is also found.
+# allow_rwx MyLauncher.exe
+# allow_rwx game-anticheat.exe
+#
+# Set this to restore the noisy v0.1 behavior (one HIGH alert per RWX
+# region, no triage) if you want the raw firehose for a specific host.
+# memory_strict
+
+# --- v0.2: alert suppression ---
+# Drop any alert whose rendered description contains this substring.
+# Use for a specific known-noisy finding you've triaged and don't want
+# repeated on every scan (a specific service, a specific IP, ...).
+# suppress Service 'SomeThirdPartyUpdater' points at missing binary
+# suppress 192.168.1.50
+
+# --- v0.2: extra known-good network ports ---
+# Extra ports not flagged as UNKNOWN_SERVICE. The built-in list already
+# covers standard Windows services (NTP/NetBIOS/DHCP/SSDP/LLMNR/mDNS/
+# WS-Discovery/IKE), which is what v0.1 was missing.
+# known_udp_port 51820
+# known_tcp_port 8443
+
+# --- v0.2: event log lookback window ---
+# How many hours of Security/System/Defender event log history to scan
+# (default 24).
+# events_hours 48
 
 # --- Verbose / debug output ---
 # verbose

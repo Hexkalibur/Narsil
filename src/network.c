@@ -3,27 +3,33 @@
  *
  * Takes a one-shot snapshot of all active TCP and UDP endpoints,
  * correlates each with the owning process, and flags:
- *   - Connections to/from blocked IPs
+ *   - Connections to/from blocked IPs (exact match or CIDR block)
  *   - Connections on suspicious ports
  *   - Processes connecting from staging paths (Temp, AppData, Downloads)
  *   - Listening ports on non-standard interfaces
+ *   - Beaconing: repeated outbound connections to the same remote endpoint
+ *     from a process running out of a staging directory
  *
  * No threads, no polling. Called once by run_scan, returns.
  */
 #include "../include/ids.h"
 #include "../include/report.h"
 
-/* User-writable paths that legitimate software rarely runs from */
-static const char *STAGING_PATHS[] = {
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\downloads\\", "\\desktop\\", "\\public\\",
-    NULL
+/* Well-known legitimate listening ports (not flagged as unknown service).
+ * v0.1 only whitelisted a handful of TCP ports and applied the same short
+ * list to UDP, so routine Windows services -- NTP client (123), NetBIOS
+ * Name/Datagram (137/138), DHCP (67/68), SSDP (1900), LLMNR (5355),
+ * mDNS (5353), WS-Discovery (3702) and IKE/IPsec (500/4500) -- lit up as
+ * UNKNOWN_SERVICE on every scan. Those are now whitelisted by default. */
+static const WORD KNOWN_PORTS[] = {
+    80, 443, 135, 139, 445, 3389, 5040, 7680,
+    67, 68, 123, 137, 138, 500, 1900, 3702, 4500, 5353, 5355,
+    0
 };
 
-/* Well-known legitimate listening ports (not flagged as unknown service) */
-static const WORD KNOWN_PORTS[] = {
-    80, 443, 135, 139, 445, 3389, 5040, 7680, 0
-};
+/* Minimum window between repeated connections to the same remote endpoint
+   before it counts as beacon-like activity (see beacon tracker below). */
+#define BEACON_MIN_HITS   4
 
 /* -----------------------------------------------
    PID -> process name cache
@@ -74,32 +80,17 @@ static const PidEntry *pid_lookup(DWORD pid) {
 /* -----------------------------------------------
    Helpers
    ----------------------------------------------- */
-static BOOL is_blocked(IdsConfig *cfg, const char *ip) {
-    for (int i = 0; i < cfg->blocked_ip_count; i++)
-        if (strcmp(cfg->blocked_ips[i], ip) == 0) return TRUE;
-    return FALSE;
-}
-
 static BOOL is_suspicious_port(IdsConfig *cfg, WORD port) {
     for (int i = 0; i < cfg->suspicious_port_count; i++)
         if (cfg->suspicious_ports[i] == port) return TRUE;
     return FALSE;
 }
 
-static BOOL is_known_port(WORD port) {
+static BOOL is_known_port(IdsConfig *cfg, WORD port) {
     for (int i = 0; KNOWN_PORTS[i]; i++)
         if (KNOWN_PORTS[i] == port) return TRUE;
-    return FALSE;
-}
-
-static BOOL is_staging_path(const char *path) {
-    char low[MAX_PATH];
-    size_t len = strlen(path);
-    if (len >= MAX_PATH) len = MAX_PATH - 1;
-    memcpy(low, path, len); low[len] = '\0';
-    for (char *p = low; *p; p++) *p = (char)tolower((unsigned char)*p);
-    for (int i = 0; STAGING_PATHS[i]; i++)
-        if (strstr(low, STAGING_PATHS[i])) return TRUE;
+    for (int i = 0; i < cfg->known_udp_port_count; i++)
+        if (cfg->known_udp_ports[i] == port) return TRUE;
     return FALSE;
 }
 
@@ -147,6 +138,39 @@ static void emit(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl,
 }
 
 /* -----------------------------------------------
+   Per-process distinct remote-endpoint tracker (single-snapshot heuristic).
+   Narsil is scan-only -- one process, no threads, no state across runs --
+   so real time-series beacon detection (fixed-interval callbacks) is out
+   of reach. What one TCP snapshot *can* show is a staging-path process
+   holding many simultaneous connections to distinct external IPs, which is
+   the static signature of a multi-channel C2 client or an active scanner.
+   ----------------------------------------------- */
+#define BEACON_CAP        256
+#define BEACON_MAX_REMOTE 32
+typedef struct {
+    DWORD pid;
+    char  remote[BEACON_MAX_REMOTE][MAX_IP_LEN];
+    int   n;
+} BeaconTrack;
+static BeaconTrack g_beacon[BEACON_CAP];
+static int         g_beacon_n = 0;
+
+static void beacon_note(DWORD pid, const char *remote_ip) {
+    BeaconTrack *t = NULL;
+    for (int i = 0; i < g_beacon_n; i++)
+        if (g_beacon[i].pid == pid) { t = &g_beacon[i]; break; }
+    if (!t) {
+        if (g_beacon_n >= BEACON_CAP) return;
+        t = &g_beacon[g_beacon_n++];
+        t->pid = pid; t->n = 0;
+    }
+    for (int i = 0; i < t->n; i++)
+        if (strcmp(t->remote[i], remote_ip) == 0) return;   /* already counted */
+    if (t->n < BEACON_MAX_REMOTE)
+        strncpy(t->remote[t->n++], remote_ip, MAX_IP_LEN - 1);
+}
+
+/* -----------------------------------------------
    TCP snapshot
    ----------------------------------------------- */
 static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
@@ -191,7 +215,7 @@ static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
         report_table_add(tbl, path, name, detail, ENTRY_OK, "");
 
         /* Checks */
-        if (is_blocked(cfg, dst)) {
+        if (narsil_ip_blocked(cfg, dst)) {
             emit(cfg, rep, tbl, ALERT_BLOCKED_IP, SEV_CRITICAL,
                  src, sport, dst, dport, pid, name, "T1071",
                  "Connection to blocked IP %s:%u by %s (pid=%lu)",
@@ -204,13 +228,15 @@ static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
                  "Connection to suspicious port %u by %s (pid=%lu)",
                  dport, name, pid);
         }
-        if (path[0] && is_staging_path(path) &&
+        if (path[0] && narsil_is_staging_path(path) &&
             row->dwState == MIB_TCP_STATE_ESTAB && !is_loopback(dst)) {
             emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, SEV_HIGH,
                  src, sport, dst, dport, pid, name, "T1059",
                  "Process in staging path has active connection: %s -> %s:%u",
                  path, dst, dport);
         }
+        if (row->dwState == MIB_TCP_STATE_ESTAB && !is_loopback(dst))
+            beacon_note(pid, dst);
     }
     free(table);
 }
@@ -258,7 +284,7 @@ static void scan_udp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
                  "UDP listener on suspicious port %u by %s (pid=%lu)",
                  port, name, pid);
         }
-        if (!is_loopback(local) && !is_known_port(port) && port < 1024) {
+        if (!is_loopback(local) && !is_known_port(cfg, port) && port < 1024) {
             emit(cfg, rep, tbl, ALERT_UNKNOWN_SERVICE, SEV_MEDIUM,
                  local, port, NULL, 0, pid, name, NULL,
                  "Unknown UDP service on port %u by %s (pid=%lu)",
@@ -281,11 +307,30 @@ void ids_scan_network(IdsConfig *cfg, ScanReport *rep) {
     }
 
     pid_cache_build();
+    g_beacon_n = 0;
 
     EvidenceTable *tbl = report_table_begin(rep, "network");
 
     scan_tcp(cfg, rep, tbl);
     scan_udp(cfg, rep, tbl);
+
+    /* Multi-endpoint heuristic: a staging-path process holding several
+       simultaneous connections to distinct external hosts. */
+    for (int i = 0; i < g_beacon_n; i++) {
+        BeaconTrack *t = &g_beacon[i];
+        if (t->n < BEACON_MIN_HITS) continue;
+
+        const PidEntry *pe = pid_lookup(t->pid);
+        const char *name = pe ? pe->name : "?";
+        const char *path = pe ? pe->path : "";
+        if (!path[0] || !narsil_is_staging_path(path)) continue;
+
+        emit(cfg, rep, tbl, ALERT_C2_BEACON, SEV_HIGH,
+             "", 0, t->remote[0], 0, t->pid, name, "T1071",
+             "Process in staging path holds %d simultaneous connections to "
+             "distinct external hosts (first: %s) -- possible multi-channel C2",
+             t->n, t->remote[0]);
+    }
 
     WSACleanup();
     LOG_INFO("scan: network -- done  connections=%d  flagged=%d",

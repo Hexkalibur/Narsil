@@ -16,26 +16,8 @@
 #include "../include/ids.h"
 #include "../include/report.h"
 
-/* User-writable paths legitimate autostart entries rarely point at. */
-static const char *STAGING[] = {
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\downloads\\", "\\desktop\\", "\\public\\",
-    NULL
-};
-
 static void to_lower(char *s) {
     for (; *s; s++) *s = (char)tolower((unsigned char)*s);
-}
-
-static BOOL is_staging(const char *path) {
-    char low[MAX_PATH];
-    size_t len = strlen(path);
-    if (len >= MAX_PATH) len = MAX_PATH - 1;
-    memcpy(low, path, len); low[len] = '\0';
-    to_lower(low);
-    for (int i = 0; STAGING[i]; i++)
-        if (strstr(low, STAGING[i])) return TRUE;
-    return FALSE;
 }
 
 /* Pull the executable path out of a command line:
@@ -111,7 +93,7 @@ static void inspect_target(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl,
     char detail[MAX_PATH];
     snprintf(detail, sizeof(detail), "%s -> %s", origin, command);
 
-    if (exe[0] && is_staging(exe)) {
+    if (exe[0] && narsil_is_staging_path(exe)) {
         emit(cfg, rep, tbl, SEV_HIGH, mitre, name, exe, ENTRY_FLAGGED,
              "autostart from staging path",
              "Persistence via %s: '%s' runs %s (staging path)",
@@ -242,7 +224,7 @@ static void scan_services(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
             char exe[MAX_PATH] = {0};
             extract_exe(binpath, exe, sizeof(exe));
 
-            if (exe[0] && is_staging(exe)) {
+            if (exe[0] && narsil_is_staging_path(exe)) {
                 emit(cfg, rep, tbl, SEV_HIGH, "T1543", sname, exe, ENTRY_FLAGGED,
                      "service binary in staging path",
                      "Service '%s' runs from staging path: %s", sname, exe);

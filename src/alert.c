@@ -44,12 +44,16 @@ const char *ids_alert_type_str(AlertType t) {
         case ALERT_SUSPICIOUS_PROCESS: return "SUSPICIOUS_PROCESS";
         case ALERT_BRUTE_FORCE:        return "BRUTE_FORCE";
         case ALERT_SUSPICIOUS_EVENT:   return "SUSPICIOUS_EVENT";
+        case ALERT_DEFENDER_EVENT:     return "DEFENDER_EVENT";
         case ALERT_LOLBIN:             return "LOLBIN";
         case ALERT_CREDENTIAL_ACCESS:  return "CREDENTIAL_ACCESS";
+        case ALERT_SUSPICIOUS_CMDLINE: return "SUSPICIOUS_CMDLINE";
         case ALERT_SUSPICIOUS_DRIVER:  return "SUSPICIOUS_DRIVER";
         case ALERT_HIDDEN_PROCESS:     return "HIDDEN_PROCESS";
         case ALERT_PERSISTENCE:        return "PERSISTENCE";
         case ALERT_MEMORY_ANOMALY:     return "MEMORY_ANOMALY";
+        case ALERT_INJECTED_PE:        return "INJECTED_PE";
+        case ALERT_INJECTED_THREAD:    return "INJECTED_THREAD";
         case ALERT_YARA_MATCH:         return "YARA_MATCH";
         case ALERT_FIM:                return "FIM";
         case ALERT_SENSITIVE_DATA:     return "SENSITIVE_DATA";
@@ -60,6 +64,18 @@ const char *ids_alert_type_str(AlertType t) {
         case ALERT_ANTIFORENSIC:       return "ANTIFORENSIC";
         default:                       return "UNKNOWN";
     }
+}
+
+/* -----------------------------------------------
+   Alert suppression -- operator-defined substring filters against the
+   rendered description, so a known-noisy finding (a specific service,
+   a specific IP) can be silenced without disabling the whole module.
+   ----------------------------------------------- */
+BOOL ids_alert_suppressed(IdsConfig *cfg, const Alert *a) {
+    for (int i = 0; i < cfg->suppress_count; i++)
+        if (narsil_stristr(a->description, cfg->suppress[i]))
+            return TRUE;
+    return FALSE;
 }
 
 void ids_timestamp_str(time_t t, char *buf, size_t len) {
@@ -115,6 +131,8 @@ void ids_print_alert(const Alert *a) {
    JSONL file logging
    ----------------------------------------------- */
 void ids_log_alert(IdsConfig *cfg, const Alert *a) {
+    if (ids_alert_suppressed(cfg, a)) return;
+
     FILE *fp = fopen(cfg->log_path, "a");
     if (!fp) {
         LOG_WARN("cannot open log file: %s (err=%lu)", cfg->log_path, GetLastError());

@@ -1,0 +1,2050 @@
+From 422c68c86b7f6d132ed4494067bed78181c4ba41 Mon Sep 17 00:00:00 2001
+From: Hexkalibur <ordo-imperialis@protonmail.com>
+Date: Sat, 4 Jul 2026 18:39:01 +0000
+Subject: [PATCH] v0.2: evidence-based memory triage, shared helpers, noise
+ reduction
+
+The v0.1 memory scanner alerted HIGH on every process holding a single
+private RWX region, which on a normal desktop is almost entirely false
+positives (JIT engines, browsers, .NET/CLR hosts, Defender's own AMSI
+process, one alert per backgroundTaskHost.exe instance -- 79 of the 82
+alerts in the last scan were this). v0.2 keeps the same region walk but
+adds real evidence before raising severity:
+
+- Mapped-PE detection: private executable regions are read back and
+  checked for an MZ/PE header. A manually mapped module in private
+  memory is a near-certain reflective-injection footprint
+  (ALERT_INJECTED_PE, CRITICAL).
+- Thread-start correlation: every thread's Win32 start address is
+  resolved (NtQueryInformationThread) and checked against private
+  executable regions -- the signature of CreateRemoteThread/APC
+  shellcode (ALERT_INJECTED_THREAD, CRITICAL).
+- A built-in + configurable (allow_rwx) JIT allow-list so plain RWX
+  with no PE/thread evidence in known hosts becomes evidence, not an
+  alert. memory_strict restores the raw v0.1 behavior.
+
+Other additions:
+- src/util.c centralizes staging-path checks, Authenticode/catalog
+  verification, and IP-block matching that were previously copy-pasted
+  across process.c, network.c, persistence.c and kernel.c.
+- A suspicious command-line / script pattern table (encoded PowerShell,
+  LOLBin proxy execution, ransomware/anti-forensic indicators), used by
+  both the live process scanner (via PEB command-line reads) and 4688
+  event records.
+- CIDR-range IP blocking, an expanded known-ports list so routine
+  Windows services (NTP/NetBIOS/DHCP/SSDP/LLMNR/mDNS/WS-Discovery/IKE)
+  stop being flagged as UNKNOWN_SERVICE, a same-scan multi-endpoint
+  beacon heuristic for staging-path processes, Defender-operational-log
+  correlation, and operator-defined alert suppression.
+---
+ Makefile          |   3 +-
+ README.md         |  55 ++++++-
+ ids.conf.example  |  37 ++++-
+ include/ids.h     |  56 ++++++-
+ src/alert.c       |  18 +++
+ src/config.c      | 107 ++++++++++++-
+ src/events.c      |  71 +++++++--
+ src/kernel.c      | 121 +--------------
+ src/memory.c      | 375 ++++++++++++++++++++++++++++++++++++----------
+ src/network.c     | 107 +++++++++----
+ src/persistence.c |  22 +--
+ src/process.c     | 126 +++++-----------
+ src/report.c      |   1 +
+ src/util.c        | 341 +++++++++++++++++++++++++++++++++++++++++
+ 14 files changed, 1076 insertions(+), 364 deletions(-)
+ create mode 100644 src/util.c
+
+diff --git a/Makefile b/Makefile
+index ac1ab8d..202da14 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,7 +18,8 @@ SRCS = src/main.c        \
+        src/kernel.c      \
+        src/rootkit.c     \
+        src/persistence.c \
+-       src/memory.c
++       src/memory.c      \
++       src/util.c
+ 
+ TARGET = narsil.exe
+ 
+diff --git a/README.md b/README.md
+index bb7dd55..9b10aa2 100644
+--- a/README.md
++++ b/README.md
+@@ -27,13 +27,44 @@ into a single report:
+ | **kernel** | Driver enumeration + Authenticode/catalog signature check (unsigned, tampered, anonymous, non-standard path) |
+ | **rootkit** | Hidden-process detection by cross-referencing `NtQuerySystemInformation` against the Toolhelp snapshot |
+ | **persistence** | Registry Run/RunOnce keys, Winlogon `Userinit`/`Shell` hijacks, and Win32 services in staging paths |
+-| **processes** | Known-bad names, parent-child anomalies (Office to shell), staging paths, signature tiers |
+-| **memory** | Committed private RWX regions, the classic footprint of injected shellcode |
+-| **network** | Active TCP/UDP endpoints: blocked IPs, suspicious ports, processes phoning home from staging paths |
+-| **events** | Recent Security/System event log entries: brute force, new users/services, log clearing |
++| **processes** | Known-bad names, command-line pattern matching (encoded PowerShell, LOLBins, ransomware indicators), parent-child anomalies (Office to shell), staging paths, signature tiers |
++| **memory** | RWX regions triaged by content (mapped-PE detection) and thread-start correlation, not raised as noise per region |
++| **network** | Active TCP/UDP endpoints: blocked IPs/CIDR ranges, suspicious ports, staging-path processes phoning home, multi-endpoint beacon heuristic |
++| **events** | Recent Security/System/Defender-Operational event log entries: brute force, new users/services, log clearing, suspicious 4688 command lines, Defender detections |
+ 
+ Findings are mapped to MITRE ATT&CK technique IDs.
+ 
++### v0.2 highlights
++
++v0.1's memory scanner alerted on every process holding a single private
++RWX region, which floods a normal desktop with false positives (JIT
++engines, browsers, Defender's own AMSI host, one alert per
++`backgroundTaskHost.exe` instance). v0.2 keeps the same region walk but
++adds evidence before raising severity:
++
++- **Mapped-PE detection**: private executable regions are read back and
++  checked for an `MZ`/`PE` header. A manually mapped module in private
++  memory is treated as a near-certain reflective-injection indicator
++  (`INJECTED_PE`, CRITICAL) regardless of which process it's in.
++- **Thread-start correlation**: every thread's Win32 start address is
++  resolved and checked against private executable regions. A thread whose
++  entry point lives in private, non-image memory is the signature of
++  `CreateRemoteThread`/APC shellcode (`INJECTED_THREAD`, CRITICAL).
++- **JIT allow-list**: browsers, `.NET`/CLR hosts and Defender's own AMSI
++  process are recognized by default; plain RWX with no PE/thread evidence
++  in these is recorded as evidence, not raised as an alert. Configurable
++  via `allow_rwx` in `ids.conf`. `memory_strict` restores the raw v0.1
++  behavior for analysts who want it.
++
++Other v0.2 additions: command-line pattern matching shared between the
++process scanner and 4688 event records (encoded PowerShell, LOLBin proxy
++execution, ransomware/anti-forensic indicators), CIDR-range IP blocking,
++a Defender-operational-log correlation, a same-scan multi-endpoint beacon
++heuristic for staging-path processes, operator-defined alert suppression,
++and an expanded known-ports list so routine Windows services (NTP,
++NetBIOS, DHCP, SSDP, LLMNR, mDNS, WS-Discovery, IKE) stop being flagged as
++`UNKNOWN_SERVICE`.
++
+ ## Build
+ 
+ Requires a C toolchain for Windows (MSVC or MinGW-w64).
+@@ -75,14 +106,22 @@ Copy `ids.conf.example` to `ids.conf` and pass it with `-c`. Supported
+ directives:
+ 
+ ```
+-log_path        <path>     # alert JSONL log destination
+-blocked_ip      <ip>       # flag any connection to/from this IP
+-suspicious_port <port>     # flag any endpoint on this port
+-verbose                    # enable debug output
++log_path        <path>       # alert JSONL log destination
++blocked_ip      <ip[/cidr]>  # flag any connection to/from this IP or block
++suspicious_port <port>       # flag any endpoint on this port
++verbose                      # enable debug output
+ 
+ # Skip individual scan modules (all run by default):
+ no_kernel  no_rootkit  no_persistence
+ no_process  no_memory  no_network  no_events
++
++# v0.2 -- noise control
++allow_rwx        <exe name>  # don't alert plain RWX findings in this process
++memory_strict                # restore v0.1: one HIGH alert per RWX region
++suppress         <substring> # drop any alert whose description matches
++known_udp_port   <port>      # extra port not flagged as unknown service
++known_tcp_port   <port>      # extra port not flagged as unknown service
++events_hours     <n>         # event-log lookback window (default 24)
+ ```
+ 
+ ## Requirements
+diff --git a/ids.conf.example b/ids.conf.example
+index e1fa846..5fd0623 100644
+--- a/ids.conf.example
++++ b/ids.conf.example
+@@ -7,9 +7,11 @@
+ # log_path ids_alerts.jsonl
+ 
+ # --- Blocked IPs ---
+-# Flag any connection to/from these addresses.
++# Flag any connection to/from these addresses. CIDR ranges are supported
++# (v0.2) for blocking whole netblocks in one directive.
+ # blocked_ip 10.0.0.1
+ # blocked_ip 192.168.1.100
++# blocked_ip 45.146.164.0/24
+ 
+ # --- Suspicious ports ---
+ # Flag any endpoint (TCP/UDP) on these ports, in addition to the
+@@ -28,5 +30,38 @@
+ # no_network
+ # no_events
+ 
++# --- v0.2: memory scan noise control ---
++# By default Narsil triages RWX findings (mapped-PE / thread-entry
++# correlation) instead of alerting on every RWX region like v0.1 did.
++# Add extra processes here that legitimately JIT/allocate RWX memory on
++# your fleet (the common browsers, .NET host, and Defender are already
++# built in) so plain RWX findings in them are recorded as evidence, not
++# alerts, unless a mapped PE or a suspicious thread entry is also found.
++# allow_rwx MyLauncher.exe
++# allow_rwx game-anticheat.exe
++#
++# Set this to restore the noisy v0.1 behavior (one HIGH alert per RWX
++# region, no triage) if you want the raw firehose for a specific host.
++# memory_strict
++
++# --- v0.2: alert suppression ---
++# Drop any alert whose rendered description contains this substring.
++# Use for a specific known-noisy finding you've triaged and don't want
++# repeated on every scan (a specific service, a specific IP, ...).
++# suppress Service 'SomeThirdPartyUpdater' points at missing binary
++# suppress 192.168.1.50
++
++# --- v0.2: extra known-good network ports ---
++# Extra ports not flagged as UNKNOWN_SERVICE. The built-in list already
++# covers standard Windows services (NTP/NetBIOS/DHCP/SSDP/LLMNR/mDNS/
++# WS-Discovery/IKE), which is what v0.1 was missing.
++# known_udp_port 51820
++# known_tcp_port 8443
++
++# --- v0.2: event log lookback window ---
++# How many hours of Security/System/Defender event log history to scan
++# (default 24).
++# events_hours 48
++
+ # --- Verbose / debug output ---
+ # verbose
+diff --git a/include/ids.h b/include/ids.h
+index 496eb04..923b702 100644
+--- a/include/ids.h
++++ b/include/ids.h
+@@ -23,7 +23,7 @@
+ /* -----------------------------------------------
+    Version
+    ----------------------------------------------- */
+-#define IDS_VERSION  "0.1.0"
++#define IDS_VERSION  "0.2.0"
+ 
+ /* -----------------------------------------------
+    Limits
+@@ -34,6 +34,10 @@
+ #define MAX_IP_LEN           46
+ #define MAX_BLOCKED_IPS      256
+ #define MAX_SUSPICIOUS_PORTS 64
++#define MAX_ALLOW_PROCS      64
++#define MAX_SUPPRESS         128
++#define MAX_SUPPRESS_LEN     128
++#define MAX_KNOWN_PORTS      128
+ #define ALERT_LOG_FILE       "ids_alerts.jsonl"
+ 
+ /* -----------------------------------------------
+@@ -85,9 +89,11 @@ typedef enum {
+     ALERT_SUSPICIOUS_PROCESS,
+     ALERT_LOLBIN,
+     ALERT_CREDENTIAL_ACCESS,
++    ALERT_SUSPICIOUS_CMDLINE,
+     /* Events */
+     ALERT_BRUTE_FORCE,
+     ALERT_SUSPICIOUS_EVENT,
++    ALERT_DEFENDER_EVENT,
+     /* Kernel / rootkit */
+     ALERT_SUSPICIOUS_DRIVER,
+     ALERT_HIDDEN_PROCESS,
+@@ -95,6 +101,8 @@ typedef enum {
+     ALERT_PERSISTENCE,
+     /* Memory */
+     ALERT_MEMORY_ANOMALY,
++    ALERT_INJECTED_PE,
++    ALERT_INJECTED_THREAD,
+     ALERT_YARA_MATCH,
+     /* Files */
+     ALERT_FIM,
+@@ -136,6 +144,9 @@ typedef struct {
+     char    log_path[MAX_LOG_PATH];
+     char    blocked_ips[MAX_BLOCKED_IPS][MAX_IP_LEN];
+     int     blocked_ip_count;
++    /* CIDR block entries (IPv4), parsed from "a.b.c.d/nn" */
++    struct { DWORD net; DWORD mask; } blocked_nets[MAX_BLOCKED_IPS];
++    int     blocked_net_count;
+     WORD    suspicious_ports[MAX_SUSPICIOUS_PORTS];
+     int     suspicious_port_count;
+     BOOL    verbose;
+@@ -148,9 +159,49 @@ typedef struct {
+     BOOL    scan_memory;
+     BOOL    scan_network;
+     BOOL    scan_events;
++    /* v0.2 -- noise control */
++    char    allow_rwx[MAX_ALLOW_PROCS][64];   /* processes allowed RWX memory */
++    int     allow_rwx_count;
++    char    suppress[MAX_SUPPRESS][MAX_SUPPRESS_LEN]; /* alert substring filters */
++    int     suppress_count;
++    WORD    known_udp_ports[MAX_KNOWN_PORTS]; /* extra known UDP services   */
++    int     known_udp_port_count;
++    WORD    known_tcp_ports[MAX_KNOWN_PORTS]; /* extra known TCP services   */
++    int     known_tcp_port_count;
++    BOOL    memory_strict;                    /* v0.1 behavior: alert every RWX */
++    int     events_hours_back;                /* event-log lookback (default 24) */
+     SRWLOCK config_lock;
+ } IdsConfig;
+ 
++/* Set once by main(); used for suppression checks in report_add(), which
++   has no cfg parameter of its own. */
++extern IdsConfig *g_active_cfg;
++
++/* -----------------------------------------------
++   Shared helpers (util.c)
++   ----------------------------------------------- */
++
++/* Authenticode status: embedded PE signature first, catalog fallback. */
++typedef enum { NSIG_VALID, NSIG_UNSIGNED, NSIG_INVALID } NarsilSig;
++
++/* Suspicious command-line / script pattern table entry. */
++typedef struct {
++    const char *pattern;   /* lowercase substring to match  */
++    Severity    sev;
++    const char *mitre;     /* MITRE ATT&CK technique        */
++    const char *why;       /* human-readable classification */
++} NarsilPattern;
++
++const char *narsil_stristr(const char *hay, const char *needle);
++void        narsil_lower_copy(char *dst, const char *src, size_t dst_len);
++BOOL        narsil_is_staging_path(const char *path);
++NarsilSig   narsil_sig_verify(const char *path);
++const char *narsil_sig_str(NarsilSig s);
++void        narsil_get_exe_path(DWORD pid, char *out, DWORD out_sz);
++BOOL        narsil_get_cmdline(DWORD pid, char *out, size_t out_len);
++const NarsilPattern *narsil_match_pattern(const char *text);
++BOOL        narsil_ip_blocked(IdsConfig *cfg, const char *ip);
++
+ /* -----------------------------------------------
+    Forward declaration for ScanReport
+    (full definition in report.h)
+@@ -170,6 +221,7 @@ void        ids_config_free(IdsConfig *cfg);
+ void        ids_alert(IdsConfig *cfg, Alert *a);
+ void        ids_log_alert(IdsConfig *cfg, const Alert *a);
+ void        ids_print_alert(const Alert *a);
++BOOL        ids_alert_suppressed(IdsConfig *cfg, const Alert *a);
+ void        narsil_json_escape(const char *src, char *dst, size_t dst_len);
+ const char *ids_severity_str(Severity s);
+ const char *ids_alert_type_str(AlertType t);
+@@ -184,4 +236,4 @@ void ids_scan_network    (IdsConfig *cfg, ScanReport *rep);
+ void ids_scan_events     (IdsConfig *cfg, ScanReport *rep);
+ void ids_scan_persistence(IdsConfig *cfg, ScanReport *rep);
+ 
+-#endif /* IDS_H */
+\ No newline at end of file
++#endif /* IDS_H */
+diff --git a/src/alert.c b/src/alert.c
+index 72cff48..08709fa 100644
+--- a/src/alert.c
++++ b/src/alert.c
+@@ -44,12 +44,16 @@ const char *ids_alert_type_str(AlertType t) {
+         case ALERT_SUSPICIOUS_PROCESS: return "SUSPICIOUS_PROCESS";
+         case ALERT_BRUTE_FORCE:        return "BRUTE_FORCE";
+         case ALERT_SUSPICIOUS_EVENT:   return "SUSPICIOUS_EVENT";
++        case ALERT_DEFENDER_EVENT:     return "DEFENDER_EVENT";
+         case ALERT_LOLBIN:             return "LOLBIN";
+         case ALERT_CREDENTIAL_ACCESS:  return "CREDENTIAL_ACCESS";
++        case ALERT_SUSPICIOUS_CMDLINE: return "SUSPICIOUS_CMDLINE";
+         case ALERT_SUSPICIOUS_DRIVER:  return "SUSPICIOUS_DRIVER";
+         case ALERT_HIDDEN_PROCESS:     return "HIDDEN_PROCESS";
+         case ALERT_PERSISTENCE:        return "PERSISTENCE";
+         case ALERT_MEMORY_ANOMALY:     return "MEMORY_ANOMALY";
++        case ALERT_INJECTED_PE:        return "INJECTED_PE";
++        case ALERT_INJECTED_THREAD:    return "INJECTED_THREAD";
+         case ALERT_YARA_MATCH:         return "YARA_MATCH";
+         case ALERT_FIM:                return "FIM";
+         case ALERT_SENSITIVE_DATA:     return "SENSITIVE_DATA";
+@@ -62,6 +66,18 @@ const char *ids_alert_type_str(AlertType t) {
+     }
+ }
+ 
++/* -----------------------------------------------
++   Alert suppression -- operator-defined substring filters against the
++   rendered description, so a known-noisy finding (a specific service,
++   a specific IP) can be silenced without disabling the whole module.
++   ----------------------------------------------- */
++BOOL ids_alert_suppressed(IdsConfig *cfg, const Alert *a) {
++    for (int i = 0; i < cfg->suppress_count; i++)
++        if (narsil_stristr(a->description, cfg->suppress[i]))
++            return TRUE;
++    return FALSE;
++}
++
+ void ids_timestamp_str(time_t t, char *buf, size_t len) {
+     struct tm *tm_info = localtime(&t);
+     if (tm_info) strftime(buf, len, "%Y-%m-%d %H:%M:%S", tm_info);
+@@ -115,6 +131,8 @@ void ids_print_alert(const Alert *a) {
+    JSONL file logging
+    ----------------------------------------------- */
+ void ids_log_alert(IdsConfig *cfg, const Alert *a) {
++    if (ids_alert_suppressed(cfg, a)) return;
++
+     FILE *fp = fopen(cfg->log_path, "a");
+     if (!fp) {
+         LOG_WARN("cannot open log file: %s (err=%lu)", cfg->log_path, GetLastError());
+diff --git a/src/config.c b/src/config.c
+index 2334ee5..0e8d054 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -3,10 +3,10 @@
+  *
+  * Config file format (plain text, one directive per line):
+  *
+- *   log_path        <path>     alert JSONL log destination
+- *   blocked_ip      <ip>       flag any connection to/from this IP
+- *   suspicious_port <port>     flag any endpoint on this port
+- *   verbose                    enable debug output
++ *   log_path        <path>       alert JSONL log destination
++ *   blocked_ip      <ip[/cidr]>  flag any connection to/from this IP or block
++ *   suspicious_port <port>       flag any endpoint on this port
++ *   verbose                      enable debug output
+  *
+  *   # Module toggles: skip a scan module entirely
+  *   no_kernel
+@@ -17,11 +17,51 @@
+  *   no_network
+  *   no_events
+  *
++ *   # v0.2 -- noise control
++ *   allow_rwx        <exe name>  don't alert plain RWX findings in this proc
++ *   suppress         <substring> drop any alert whose description matches
++ *   known_udp_port   <port>      extra port not flagged as unknown service
++ *   known_tcp_port   <port>      extra port not flagged as unknown service
++ *   memory_strict                restore v0.1 behavior: one HIGH per RWX region
++ *   events_hours     <n>          event-log lookback window (default 24)
++ *
+  * Lines starting with '#' are comments. Legacy directive aliases
+  * (log, block_ip, bad_port) are still accepted for compatibility.
+  */
+ #include "../include/ids.h"
+ 
++/* Parse "a.b.c.d/nn" into network/mask (host byte order not required --
++   we keep everything in the same byte order as struct in_addr.s_addr and
++   compare with a matching mask, so endianness cancels out). */
++static BOOL parse_cidr(const char *spec, DWORD *net, DWORD *mask) {
++    char buf[64];
++    strncpy(buf, spec, sizeof(buf) - 1);
++    buf[sizeof(buf) - 1] = '\0';
++
++    char *slash = strchr(buf, '/');
++    int prefix = 32;
++    if (slash) {
++        *slash = '\0';
++        prefix = atoi(slash + 1);
++        if (prefix < 0 || prefix > 32) return FALSE;
++    }
++
++    unsigned a, b, c, d;
++    if (sscanf(buf, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return FALSE;
++    if (a > 255 || b > 255 || c > 255 || d > 255) return FALSE;
++
++    DWORD host_order = (a << 24) | (b << 16) | (c << 8) | d;
++    DWORD mask_host  = (prefix == 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
++
++    /* Convert to network byte order to match struct in_addr.s_addr, which
++       is how narsil_ip_blocked() receives addresses from getsockopt/ip_str. */
++    *net  = htonl(host_order & mask_host);
++    *mask = htonl(mask_host);
++    return TRUE;
++}
++
++IdsConfig *g_active_cfg = NULL;
++
+ static void load_default_bad_ports(IdsConfig *cfg) {
+     WORD defaults[] = {
+         1337, 4444, 5555, 6666, 7777, 8888, 9999,  /* common RAT ports    */
+@@ -54,9 +94,13 @@ IdsConfig *ids_config_create(void) {
+ 
+     InitializeSRWLock(&cfg->config_lock);
+ 
++    cfg->memory_strict      = FALSE;
++    cfg->events_hours_back  = 24;
++
+     strncpy(cfg->log_path, ALERT_LOG_FILE, MAX_LOG_PATH - 1);
+     load_default_bad_ports(cfg);
+ 
++    g_active_cfg = cfg;
+     return cfg;
+ }
+ 
+@@ -101,7 +145,16 @@ BOOL ids_config_load(IdsConfig *cfg, const char *path) {
+ 
+         } else if ((strcmp(key, "blocked_ip") == 0 || strcmp(key, "block_ip") == 0)
+                    && fields == 2) {
+-            if (cfg->blocked_ip_count < MAX_BLOCKED_IPS) {
++            if (strchr(val, '/')) {
++                DWORD net, mask;
++                if (cfg->blocked_net_count < MAX_BLOCKED_IPS && parse_cidr(val, &net, &mask)) {
++                    cfg->blocked_nets[cfg->blocked_net_count].net  = net;
++                    cfg->blocked_nets[cfg->blocked_net_count].mask = mask;
++                    cfg->blocked_net_count++;
++                } else {
++                    LOG_WARN("config: invalid CIDR block '%s' ignored", val);
++                }
++            } else if (cfg->blocked_ip_count < MAX_BLOCKED_IPS) {
+                 strncpy(cfg->blocked_ips[cfg->blocked_ip_count], val, MAX_IP_LEN - 1);
+                 cfg->blocked_ips[cfg->blocked_ip_count][MAX_IP_LEN - 1] = '\0';
+                 cfg->blocked_ip_count++;
+@@ -122,6 +175,49 @@ BOOL ids_config_load(IdsConfig *cfg, const char *path) {
+                          MAX_SUSPICIOUS_PORTS, port);
+             }
+ 
++        } else if (strcmp(key, "allow_rwx") == 0 && fields == 2) {
++            if (cfg->allow_rwx_count < MAX_ALLOW_PROCS) {
++                strncpy(cfg->allow_rwx[cfg->allow_rwx_count], val,
++                        sizeof(cfg->allow_rwx[0]) - 1);
++                cfg->allow_rwx_count++;
++            } else {
++                LOG_WARN("config: allow_rwx list full (%d), ignoring %s",
++                         MAX_ALLOW_PROCS, val);
++            }
++
++        } else if (strcmp(key, "suppress") == 0 && fields == 2) {
++            if (cfg->suppress_count < MAX_SUPPRESS) {
++                strncpy(cfg->suppress[cfg->suppress_count], val,
++                        sizeof(cfg->suppress[0]) - 1);
++                cfg->suppress_count++;
++            } else {
++                LOG_WARN("config: suppress list full (%d), ignoring %s",
++                         MAX_SUPPRESS, val);
++            }
++
++        } else if (strcmp(key, "known_udp_port") == 0 && fields == 2) {
++            int port = atoi(val);
++            if (port <= 0 || port > 65535) {
++                LOG_WARN("config: invalid port '%s' ignored", val);
++            } else if (cfg->known_udp_port_count < MAX_KNOWN_PORTS) {
++                cfg->known_udp_ports[cfg->known_udp_port_count++] = (WORD)port;
++            }
++
++        } else if (strcmp(key, "known_tcp_port") == 0 && fields == 2) {
++            int port = atoi(val);
++            if (port <= 0 || port > 65535) {
++                LOG_WARN("config: invalid port '%s' ignored", val);
++            } else if (cfg->known_tcp_port_count < MAX_KNOWN_PORTS) {
++                cfg->known_tcp_ports[cfg->known_tcp_port_count++] = (WORD)port;
++            }
++
++        } else if (strcmp(key, "memory_strict") == 0) {
++            cfg->memory_strict = TRUE;
++
++        } else if (strcmp(key, "events_hours") == 0 && fields == 2) {
++            int hours = atoi(val);
++            cfg->events_hours_back = (hours > 0) ? hours : 24;
++
+         } else {
+             LOG_WARN("config: unknown directive '%s' ignored", key);
+         }
+@@ -133,6 +229,7 @@ BOOL ids_config_load(IdsConfig *cfg, const char *path) {
+ 
+ void ids_config_free(IdsConfig *cfg) {
+     if (!cfg) return;
++    if (g_active_cfg == cfg) g_active_cfg = NULL;
+     SecureZeroMemory(cfg, sizeof(IdsConfig));   /* wipe sensitive data */
+     free(cfg);
+ }
+diff --git a/src/events.c b/src/events.c
+index 60be496..660ea61 100644
+--- a/src/events.c
++++ b/src/events.c
+@@ -16,8 +16,8 @@
+ #include "../include/ids.h"
+ #include "../include/report.h"
+ 
+-/* How far back to look */
+-#define SCAN_HOURS_BACK    24
++/* Default lookback if the operator doesn't override events_hours in the
++   config file (see cfg->events_hours_back, default 24). */
+ #define BRUTE_THRESHOLD     5    /* failed logons within window = brute force */
+ #define BRUTE_WINDOW_SECS 300    /* 5 minutes */
+ #define MAX_EVENTS_READ   4096
+@@ -33,6 +33,10 @@
+ #define EVT_LOG_CLEARED_SEC   1102
+ #define EVT_LOG_CLEARED_SYS    104
+ 
++/* Microsoft-Windows-Windows Defender/Operational channel */
++#define EVT_DEFENDER_DETECTION 1116
++#define EVT_DEFENDER_ACTION_FAIL 1119
++
+ /* -----------------------------------------------
+    Minimal XML field extractor
+    Handles both:
+@@ -214,17 +218,36 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
+             break;
+         }
+ 
+-        case EVT_PROCESS_CREATION:
+-            a.severity = SEV_LOW;
++        case EVT_PROCESS_CREATION: {
++            /* Command-line auditing must be enabled via GPO for this field
++               to be populated; if absent we still get the image name. */
++            char cmdline[512] = {0};
++            xml_extract_data(xml, "CommandLine", cmdline, sizeof(cmdline));
++
++            const NarsilPattern *m = narsil_match_pattern(cmdline[0] ? cmdline : proc_name);
+             strncpy(a.process_name, proc_name, MAX_PATH - 1);
++
++            if (m) {
++                a.type     = ALERT_SUSPICIOUS_CMDLINE;
++                a.severity = m->sev;
++                strncpy(a.technique_id, m->mitre, sizeof(a.technique_id) - 1);
++                snprintf(a.description, MAX_DESCRIPTION,
++                         "%s: process created (4688) name=%s user=%s cmdline: %.150s",
++                         m->why, proc_name[0] ? proc_name : "?",
++                         username[0] ? username : "?", cmdline);
++                break;
++            }
++
++            /* No suspicious pattern -- low severity, evidence only. */
++            a.severity = SEV_LOW;
+             snprintf(a.description, MAX_DESCRIPTION,
+                      "Process created (4688) name=%s user=%s",
+                      proc_name[0] ? proc_name : "?",
+                      username[0]  ? username  : "?");
+-            /* Low severity — only add to evidence, don't alert */
+             report_table_add(tbl, proc_name, proc_name, ev_label, ENTRY_OK,
+                              username[0] ? username : "");
+             return;
++        }
+ 
+         case EVT_LOG_CLEARED_SEC:
+         case EVT_LOG_CLEARED_SYS:
+@@ -235,6 +258,29 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
+             strncpy(a.technique_id, "T1070", sizeof(a.technique_id) - 1);
+             break;
+ 
++        case EVT_DEFENDER_DETECTION: {
++            char threat[256] = {0}, path[MAX_PATH] = {0};
++            xml_extract_data(xml, "Threat Name", threat, sizeof(threat));
++            xml_extract_data(xml, "Path",        path,   sizeof(path));
++            a.type     = ALERT_DEFENDER_EVENT;
++            a.severity = SEV_CRITICAL;
++            if (path[0]) strncpy(a.file_path, path, MAX_PATH - 1);
++            snprintf(a.description, MAX_DESCRIPTION,
++                     "Windows Defender detection (1116): %s%s%s -- Narsil's own "
++                     "process/memory findings should be cross-checked against this",
++                     threat[0] ? threat : "unknown threat",
++                     path[0] ? " @ " : "", path);
++            break;
++        }
++
++        case EVT_DEFENDER_ACTION_FAIL:
++            a.type     = ALERT_DEFENDER_EVENT;
++            a.severity = SEV_HIGH;
++            snprintf(a.description, MAX_DESCRIPTION,
++                     "Windows Defender remediation FAILED (1119) -- threat may still "
++                     "be active on this host");
++            break;
++
+         default:
+             return;
+     }
+@@ -250,10 +296,10 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
+    Query one channel for the last N hours
+    ----------------------------------------------- */
+ static void query_channel(IdsConfig *cfg, ScanReport *rep,
+-                           EvidenceTable *tbl, const wchar_t *channel) {
++                           EvidenceTable *tbl, const wchar_t *channel,
++                           int hours_back) {
+ 
+-    /* XPath: events from the last SCAN_HOURS_BACK hours */
+-    ULONGLONG ms = (ULONGLONG)SCAN_HOURS_BACK * 3600 * 1000;
++    ULONGLONG ms = (ULONGLONG)hours_back * 3600 * 1000;
+     wchar_t xpath[256];
+     swprintf(xpath, 256,
+              L"Event/System[TimeCreated[timediff(@SystemTime) <= %I64u]]",
+@@ -288,12 +334,15 @@ static void query_channel(IdsConfig *cfg, ScanReport *rep,
+    Public entry point
+    ----------------------------------------------- */
+ void ids_scan_events(IdsConfig *cfg, ScanReport *rep) {
+-    LOG_INFO("scan: event logs (last %d hours)...", SCAN_HOURS_BACK);
++    int hours = cfg->events_hours_back > 0 ? cfg->events_hours_back : 24;
++    LOG_INFO("scan: event logs (last %d hours)...", hours);
+ 
+     EvidenceTable *tbl = report_table_begin(rep, "events");
+ 
+-    query_channel(cfg, rep, tbl, L"Security");
+-    query_channel(cfg, rep, tbl, L"System");
++    query_channel(cfg, rep, tbl, L"Security", hours);
++    query_channel(cfg, rep, tbl, L"System", hours);
++    query_channel(cfg, rep, tbl,
++                  L"Microsoft-Windows-Windows Defender/Operational", hours);
+ 
+     LOG_INFO("scan: events -- done  processed=%d  flagged=%d",
+              tbl->count, tbl->flagged_count);
+diff --git a/src/kernel.c b/src/kernel.c
+index 265cb96..ab46fcf 100644
+--- a/src/kernel.c
++++ b/src/kernel.c
+@@ -17,9 +17,6 @@
+  */
+ #include "../include/ids.h"
+ #include "../include/report.h"
+-#include <wintrust.h>
+-#include <softpub.h>
+-#include <mscat.h>
+ 
+ /* -----------------------------------------------
+    Known-good driver locations (lowercase for comparison)
+@@ -102,112 +99,8 @@ static void resolve_path(const char *kpath, char *out, size_t out_len) {
+     }
+ }
+ 
+-/* -----------------------------------------------
+-   Signature verification
+-   ----------------------------------------------- */
+-typedef enum { SIG_VALID, SIG_UNSIGNED, SIG_INVALID } SigStatus;
+-
+-/* Catalog check: hash file and look it up in the system driver catalog */
+-static BOOL is_catalog_signed(const char *path) {
+-    wchar_t wpath[MAX_PATH] = {0};
+-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH))
+-        return FALSE;
+-
+-    HANDLE hFile = CreateFileW(wpath, GENERIC_READ,
+-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+-                               NULL, OPEN_EXISTING, 0, NULL);
+-    if (hFile == INVALID_HANDLE_VALUE) {
+-        LOG_DBG("kernel: catalog_open failed: %s (err=%lu)", path, GetLastError());
+-        return FALSE;
+-    }
+-
+-    HCATADMIN hAdmin = NULL;
+-    GUID action = DRIVER_ACTION_VERIFY;
+-    if (!CryptCATAdminAcquireContext(&hAdmin, &action, 0)) {
+-        LOG_DBG("kernel: CryptCATAdminAcquireContext failed (err=%lu)", GetLastError());
+-        CloseHandle(hFile);
+-        return FALSE;
+-    }
+-
+-    /* First call: get required hash length */
+-    DWORD hashLen = 0;
+-    CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, NULL, 0);
+-
+-    BOOL found = FALSE;
+-    if (hashLen > 0) {
+-        BYTE *hash = (BYTE *)malloc(hashLen);
+-        if (hash) {
+-            if (CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hash, 0)) {
+-                HCATINFO hInfo = CryptCATAdminEnumCatalogFromHash(
+-                                     hAdmin, hash, hashLen, 0, NULL);
+-                if (hInfo) {
+-                    found = TRUE;
+-                    CryptCATAdminReleaseCatalogContext(hAdmin, hInfo, 0);
+-                }
+-            } else {
+-                LOG_DBG("kernel: CalcHash failed: %s (err=%lu)", path, GetLastError());
+-            }
+-            free(hash);
+-        }
+-    } else {
+-        LOG_DBG("kernel: hashLen=0 for %s", path);
+-    }
+-
+-    CloseHandle(hFile);
+-    CryptCATAdminReleaseContext(hAdmin, 0);
+-    LOG_DBG("kernel: catalog(%s) -> %s", path, found ? "SIGNED" : "NOT FOUND");
+-    return found;
+-}
+-
+-/* Full verification: embedded PE sig first, catalog fallback */
+-static SigStatus sig_verify(const char *path) {
+-    wchar_t wpath[MAX_PATH] = {0};
+-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH)) {
+-        LOG_WARN("kernel: MultiByteToWideChar failed: %s (err=%lu)", path, GetLastError());
+-        return SIG_INVALID;
+-    }
+-
+-    WINTRUST_FILE_INFO fi;
+-    memset(&fi, 0, sizeof(fi));
+-    fi.cbStruct      = sizeof(fi);
+-    fi.pcwszFilePath = wpath;
+-
+-    WINTRUST_DATA wd;
+-    memset(&wd, 0, sizeof(wd));
+-    wd.cbStruct            = sizeof(wd);
+-    wd.dwUnionChoice       = WTD_CHOICE_FILE;
+-    wd.pFile               = &fi;
+-    wd.dwUIChoice          = WTD_UI_NONE;
+-    wd.fdwRevocationChecks = WTD_REVOKE_NONE;   /* no network round-trips */
+-    wd.dwStateAction       = WTD_STATEACTION_VERIFY;
+-    wd.dwProvFlags         = WTD_SAFER_FLAG;
+-
+-    GUID guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+-    LONG rc   = WinVerifyTrust(NULL, &guid, &wd);
+-
+-    /* Always release WinVerifyTrust resources */
+-    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+-    WinVerifyTrust(NULL, &guid, &wd);
+-
+-    if (rc == ERROR_SUCCESS) {
+-        LOG_DBG("kernel: sig(%s) EMBEDDED OK", path);
+-        return SIG_VALID;
+-    }
+-
+-    if (rc == TRUST_E_NOSIGNATURE) {
+-        /* No embedded sig — try system catalog (standard for inbox drivers) */
+-        if (is_catalog_signed(path)) {
+-            LOG_DBG("kernel: sig(%s) CATALOG OK", path);
+-            return SIG_VALID;
+-        }
+-        LOG_DBG("kernel: sig(%s) UNSIGNED", path);
+-        return SIG_UNSIGNED;
+-    }
+-
+-    /* Any other error = tampered / invalid chain */
+-    LOG_DBG("kernel: sig(%s) INVALID rc=0x%lx", path, (unsigned long)rc);
+-    return SIG_INVALID;
+-}
++/* Signature verification (embedded PE sig + catalog fallback) is shared
++   with process.c/persistence.c via narsil_sig_verify() in util.c. */
+ 
+ /* -----------------------------------------------
+    Emit a driver alert to both report and live log.
+@@ -313,18 +206,16 @@ void ids_scan_kernel(IdsConfig *cfg, ScanReport *rep) {
+         }
+ 
+         /* Signature check */
+-        SigStatus sig  = sig_verify(w32path);
+-        const char *sig_str = (sig == SIG_VALID)    ? "signed (embedded or catalog)" :
+-                              (sig == SIG_UNSIGNED)  ? "unsigned" :
+-                                                       "tampered";
++        NarsilSig sig  = narsil_sig_verify(w32path);
++        const char *sig_str = narsil_sig_str(sig);
+ 
+-        if (sig == SIG_UNSIGNED) {
++        if (sig == NSIG_UNSIGNED) {
+             emit_alert(cfg, rep, SEV_HIGH, w32path,
+                 "Unsigned driver: %s", w32path);
+             report_table_add(tbl, w32path, base_name, sig_str,
+                              ENTRY_FLAGGED, "no valid signature found");
+             flagged++;
+-        } else if (sig == SIG_INVALID) {
++        } else if (sig == NSIG_INVALID) {
+             emit_alert(cfg, rep, SEV_CRITICAL, w32path,
+                 "Tampered driver (invalid signature): %s", w32path);
+             report_table_add(tbl, w32path, base_name, sig_str,
+diff --git a/src/memory.c b/src/memory.c
+index 0efa9dc..35e09d2 100644
+--- a/src/memory.c
++++ b/src/memory.c
+@@ -1,106 +1,209 @@
+ /*
+- * memory.c -- Process memory anomaly scanner (SCAN only).
++ * memory.c -- Process memory anomaly scanner (SCAN only).  v0.2
+  *
+- * Walks every accessible process's address space with VirtualQueryEx and
+- * flags regions whose protection + type combination is a strong indicator
+- * of code injection or shellcode staging:
++ * v0.1 flagged every process with a single private RWX region as HIGH.
++ * On a normal desktop that is a flood of false positives: browsers (JIT),
++ * .NET runtimes, Defender's AMSI host and dozens of backgroundTaskHost
++ * instances all legitimately allocate RWX. The v0.1 report was 79 HIGH
++ * alerts, essentially none of them real.
+  *
+- *   - MEM_PRIVATE + committed + executable-and-writable (RWX / WCX)
+- *       Private (not image-backed) pages that are both writable and
+- *       executable are the canonical footprint of injected shellcode.
+- *       Legitimate code lives in MEM_IMAGE pages and is rarely writable.
++ * v0.2 keeps VirtualQueryEx region walking but adds evidence-based triage
++ * so severity reflects how injection-like a region actually is:
+  *
+- * VirtualQueryEx only reads region metadata, never process memory, so no
+- * structured-exception handling is required. Requires SeDebugPrivilege
+- * (enabled in main.c) to open protected processes.
++ *   1. Content inspection -- private executable regions are read with
++ *      ReadProcessMemory and checked for a mapped PE image (MZ / PE magic).
++ *      A manually mapped module in private memory is a near-certain
++ *      reflective-injection footprint  ->  ALERT_INJECTED_PE (CRITICAL).
+  *
+- * Alert type: ALERT_MEMORY_ANOMALY   MITRE: T1055
++ *   2. Thread-start correlation -- every thread's Win32 start address is
++ *      resolved (NtQueryInformationThread) and tested against the private
++ *      executable regions. A thread whose entry point lives in private,
++ *      non-image memory is the footprint of CreateRemoteThread shellcode
++ *      ->  ALERT_INJECTED_THREAD (CRITICAL).
+  *
+- * yara_rules is accepted for interface parity with the other scanners;
+- * YARA content matching is not yet wired in.
++ *   3. Scoring -- regions that are merely RWX (no PE header, no thread
++ *      entry) are scored on size and count. Known JIT / .NET hosts
++ *      (allow_rwx list, seeded with common ones) are treated as evidence,
++ *      not alerts. Everything else becomes a single MEDIUM alert per
++ *      process instead of one HIGH per region.
++ *
++ * memory_strict in the config restores the noisy v0.1 behavior (one HIGH
++ * per RWX region) for analysts who want the raw firehose.
++ *
++ * Alert types: ALERT_MEMORY_ANOMALY / ALERT_INJECTED_PE / ALERT_INJECTED_THREAD
++ * MITRE: T1055 (.001 reflective, .002 hollowing, .003 remote thread)
+  */
+ #include "../include/ids.h"
+ #include "../include/report.h"
+ 
+-/* Upper bound on regions walked per process (defensive against a
+-   pathological VAD tree). 128k regions * 4KB is already a 512MB+ map. */
+ #define MAX_REGIONS_PER_PROC 131072
++#define MAX_THREAD_STARTS    4096
++
++/* Processes that legitimately fill memory with RWX/JIT pages. RWX-only
++   findings in these are recorded as evidence, not raised as alerts, unless
++   content inspection finds a mapped PE or a thread entry in private code. */
++static const char *DEFAULT_JIT[] = {
++    "firefox.exe", "chrome.exe", "msedge.exe", "msedgewebview2.exe",
++    "brave.exe", "opera.exe", "iexplore.exe", "chromium.exe",
++    "java.exe", "javaw.exe", "javaws.exe", "node.exe",
++    "devenv.exe", "code.exe", "python.exe", "python3.exe",
++    "MsMpEng.exe", "NisSrv.exe",
++    "dotnet.exe", "powershell.exe", "pwsh.exe",
++    "WhatsApp.exe", "WhatsApp.Root.exe", "Discord.exe", "Spotify.exe",
++    "PhoneExperienceHost.exe", "eve-online.exe",
++    NULL
++};
++
++/* NtQueryInformationThread -- resolve a thread's Win32 start address.
++   ntdll is not in the import libs, so bind at runtime. */
++#ifndef ThreadQuerySetWin32StartAddress
++#  define ThreadQuerySetWin32StartAddress 9
++#endif
++typedef LONG (WINAPI *PFN_NtQueryInformationThread)(
++    HANDLE, ULONG, PVOID, ULONG, PULONG);
++
++static PFN_NtQueryInformationThread g_NtQIT = NULL;
++
++static void resolve_ntqit(void) {
++    static BOOL tried = FALSE;
++    if (tried) return;
++    tried = TRUE;
++    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
++    if (ntdll)
++        g_NtQIT = (PFN_NtQueryInformationThread)(void *)
++                  GetProcAddress(ntdll, "NtQueryInformationThread");
++}
++
++/* Collect the Win32 start addresses of every thread in pid. */
++static int collect_thread_starts(DWORD pid, ULONG_PTR *out, int cap) {
++    resolve_ntqit();
++    if (!g_NtQIT) return 0;
++
++    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    if (snap == INVALID_HANDLE_VALUE) return 0;
++
++    THREADENTRY32 te; memset(&te, 0, sizeof(te)); te.dwSize = sizeof(te);
++    int n = 0;
++    if (Thread32First(snap, &te)) {
++        do {
++            if (te.th32OwnerProcessID != pid) continue;
++            if (n >= cap) break;
++            HANDLE ht = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
++                                   te.th32ThreadID);
++            if (!ht) continue;
++            ULONG_PTR start = 0;
++            if (g_NtQIT(ht, ThreadQuerySetWin32StartAddress,
++                        &start, sizeof(start), NULL) == 0 && start)
++                out[n++] = start;
++            CloseHandle(ht);
++        } while (Thread32Next(snap, &te));
++    }
++    CloseHandle(snap);
++    return n;
++}
++
++static BOOL prot_is_exec(DWORD prot) {
++    DWORD base = prot & 0xFF;
++    return base == PAGE_EXECUTE || base == PAGE_EXECUTE_READ ||
++           base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
++}
+ 
+ static BOOL prot_is_wx(DWORD prot) {
+-    /* Mask off guard/nocache/writecombine modifier bits first. */
+     DWORD base = prot & 0xFF;
+-    return base == PAGE_EXECUTE_READWRITE ||
+-           base == PAGE_EXECUTE_WRITECOPY;
++    return base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
+ }
+ 
+-/* Scan one process. Returns number of suspicious regions (or -1 if the
+-   process could not be opened). */
+-static int scan_process_memory(DWORD pid, const char *name,
+-                               IdsConfig *cfg, ScanReport *rep,
+-                               EvidenceTable *tbl) {
+-    HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+-    if (!hp) {
+-        /* PROCESS_QUERY_INFORMATION may be denied; fall back to limited. */
+-        hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+-        if (!hp) return -1;
+-    }
++static BOOL is_jit_process(IdsConfig *cfg, const char *name) {
++    for (int i = 0; DEFAULT_JIT[i]; i++)
++        if (_stricmp(name, DEFAULT_JIT[i]) == 0) return TRUE;
++    for (int i = 0; i < cfg->allow_rwx_count; i++)
++        if (_stricmp(name, cfg->allow_rwx[i]) == 0) return TRUE;
++    return FALSE;
++}
++
++/* Does a mapped PE image start at base? Reads the first bytes and checks
++   the MZ magic plus the e_lfanew-referenced PE signature. */
++static BOOL region_has_pe(HANDLE hp, unsigned char *base, SIZE_T region_size) {
++    unsigned char hdr[0x40];
++    if (region_size < sizeof(hdr)) return FALSE;
++    SIZE_T got = 0;
++    if (!ReadProcessMemory(hp, base, hdr, sizeof(hdr), &got) || got < sizeof(hdr))
++        return FALSE;
++    if (hdr[0] != 'M' || hdr[1] != 'Z') return FALSE;
++
++    LONG e_lfanew = *(LONG *)(hdr + 0x3C);
++    if (e_lfanew <= 0 || (SIZE_T)e_lfanew + 4 > region_size) return FALSE;
++
++    unsigned char sig[4];
++    if (!ReadProcessMemory(hp, base + e_lfanew, sig, 4, &got) || got < 4)
++        return FALSE;
++    return sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0;
++}
++
++/* Per-process accumulation of what the region walk found. */
++typedef struct {
++    int   rwx;              /* count of RWX (W^X-violating) regions   */
++    int   priv_exec;        /* count of private executable regions    */
++    ULONG_PTR first_hit;    /* base of first suspicious region        */
++    SIZE_T largest;         /* largest private-exec region size       */
++    BOOL  pe_found;         /* mapped PE image in private memory      */
++    ULONG_PTR pe_addr;
++    BOOL  thread_in_priv;   /* a thread starts inside private code    */
++    ULONG_PTR thread_addr;
++} MemFindings;
++
++/* Scan one process's address space (hp already opened by the caller).
++   Fills *mf with what was found. */
++static void scan_process_memory(DWORD pid, HANDLE hp, MemFindings *mf) {
++    memset(mf, 0, sizeof(*mf));
++
++    ULONG_PTR starts[MAX_THREAD_STARTS];
++    int n_starts = collect_thread_starts(pid, starts, MAX_THREAD_STARTS);
+ 
+     MEMORY_BASIC_INFORMATION mbi;
+     unsigned char *addr = 0;
+-    int suspicious = 0;
+-    unsigned long long first_hit = 0;
+     int regions = 0;
+ 
+     while (VirtualQueryEx(hp, addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+         if (++regions > MAX_REGIONS_PER_PROC) break;
+ 
+-        if (mbi.State == MEM_COMMIT &&
+-            mbi.Type  == MEM_PRIVATE &&
+-            prot_is_wx(mbi.Protect)) {
+-            if (suspicious == 0)
+-                first_hit = (unsigned long long)(ULONG_PTR)mbi.BaseAddress;
+-            suspicious++;
+-        }
+-
+         unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+-        if (next <= addr) break;   /* guard against wrap / zero region */
+-        addr = next;
+-    }
++        if (next <= addr && mbi.RegionSize != 0) break;
++
++        BOOL committed_priv_exec = (mbi.State == MEM_COMMIT &&
++                                    mbi.Type  == MEM_PRIVATE &&
++                                    prot_is_exec(mbi.Protect));
++
++        if (committed_priv_exec) {
++            if (mf->priv_exec == 0)
++                mf->first_hit = (ULONG_PTR)mbi.BaseAddress;
++            mf->priv_exec++;
++            if (mbi.RegionSize > mf->largest) mf->largest = mbi.RegionSize;
+ 
+-    CloseHandle(hp);
++            if (prot_is_wx(mbi.Protect)) mf->rwx++;
+ 
+-    if (suspicious > 0) {
+-        char exe_path[MAX_PATH] = {0};
+-        HANDLE h2 = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+-        if (h2) {
+-            DWORD sz = MAX_PATH;
+-            QueryFullProcessImageNameA(h2, 0, exe_path, &sz);
+-            CloseHandle(h2);
++            if (!mf->pe_found &&
++                region_has_pe(hp, (unsigned char *)mbi.BaseAddress, mbi.RegionSize)) {
++                mf->pe_found = TRUE;
++                mf->pe_addr  = (ULONG_PTR)mbi.BaseAddress;
++            }
++
++            if (!mf->thread_in_priv) {
++                ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
++                ULONG_PTR end  = base + mbi.RegionSize;
++                for (int i = 0; i < n_starts; i++) {
++                    if (starts[i] >= base && starts[i] < end) {
++                        mf->thread_in_priv = TRUE;
++                        mf->thread_addr    = starts[i];
++                        break;
++                    }
++                }
++            }
+         }
+ 
+-        Alert a = {0};
+-        a.type      = ALERT_MEMORY_ANOMALY;
+-        a.severity  = SEV_HIGH;
+-        a.timestamp = time(NULL);
+-        a.pid       = pid;
+-        strncpy(a.process_name, name, MAX_PATH - 1);
+-        if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
+-        strncpy(a.technique_id, "T1055", sizeof(a.technique_id) - 1);
+-        snprintf(a.description, MAX_DESCRIPTION,
+-                 "%d private RWX region(s) in %s (pid=%lu), first @ 0x%llx "
+-                 "-- possible injected code",
+-                 suspicious, name, pid, first_hit);
+-
+-        report_add(rep, &a);
+-        ids_log_alert(cfg, &a);
+-
+-        char detail[96];
+-        snprintf(detail, sizeof(detail), "%d RWX region(s) @ 0x%llx",
+-                 suspicious, first_hit);
+-        if (tbl) report_table_add(tbl, exe_path, name, detail, ENTRY_FLAGGED,
+-                                  "private executable+writable memory");
++        if (next <= addr) break;
++        addr = next;
+     }
+-    return suspicious;
+ }
+ 
+ /* -----------------------------------------------
+@@ -108,7 +211,7 @@ static int scan_process_memory(DWORD pid, const char *name,
+    ----------------------------------------------- */
+ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
+     (void)yara_rules;   /* YARA matching not yet implemented */
+-    LOG_INFO("scan: process memory (RWX private regions)...");
++    LOG_INFO("scan: process memory (RWX / injection triage)...");
+ 
+     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+     if (snap == INVALID_HANDLE_VALUE) {
+@@ -128,19 +231,135 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
+             if (pid == 0 || pid == 4) continue;   /* Idle / System */
+             total++;
+ 
+-            int r = scan_process_memory(pid, pe.szExeFile, cfg, rep, tbl);
+-            if (r < 0) { denied++; continue; }
++            HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
++                                    FALSE, pid);
++            if (!hp) hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
++                                      FALSE, pid);
++            if (!hp) { denied++; continue; }
++
++            MemFindings mf;
++            scan_process_memory(pid, hp, &mf);
+             scanned++;
+-            if (r > 0) flagged++;
++
++            if (mf.priv_exec == 0) { CloseHandle(hp); continue; }
++
++            char exe_path[MAX_PATH] = {0};
++            narsil_get_exe_path(pid, exe_path, MAX_PATH);
++            CloseHandle(hp);
++
++            BOOL jit = is_jit_process(cfg, pe.szExeFile);
++
++            /* Strict mode: reproduce v0.1 -- one HIGH per RWX-bearing process.
++               Gated on mf.rwx (not mf.priv_exec): v0.1 only ever looked at
++               W^X pages, so a process with merely private EXECUTE_READ
++               regions and no RWX must not produce a "0 RWX region(s)" alert. */
++            if (cfg->memory_strict && mf.rwx > 0) {
++                Alert a = {0};
++                a.type      = ALERT_MEMORY_ANOMALY;
++                a.severity  = SEV_HIGH;
++                a.timestamp = time(NULL);
++                a.pid       = pid;
++                strncpy(a.process_name, pe.szExeFile, MAX_PATH - 1);
++                if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
++                strncpy(a.technique_id, "T1055", sizeof(a.technique_id) - 1);
++                snprintf(a.description, MAX_DESCRIPTION,
++                         "%d private RWX region(s) in %s (pid=%lu), first @ 0x%llx",
++                         mf.rwx, pe.szExeFile, pid, (unsigned long long)mf.first_hit);
++                report_add(rep, &a);
++                ids_log_alert(cfg, &a);
++                flagged++;
++            }
++
++            /* Tier 1 -- mapped PE image in private memory: near-certain
++               reflective injection, regardless of process identity. */
++            if (mf.pe_found) {
++                Alert a = {0};
++                a.type      = ALERT_INJECTED_PE;
++                a.severity  = SEV_CRITICAL;
++                a.timestamp = time(NULL);
++                a.pid       = pid;
++                strncpy(a.process_name, pe.szExeFile, MAX_PATH - 1);
++                if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
++                strncpy(a.technique_id, "T1055.001", sizeof(a.technique_id) - 1);
++                snprintf(a.description, MAX_DESCRIPTION,
++                         "Mapped PE image in private memory of %s (pid=%lu) @ 0x%llx "
++                         "-- reflective DLL / process injection",
++                         pe.szExeFile, pid, (unsigned long long)mf.pe_addr);
++                report_add(rep, &a);
++                ids_log_alert(cfg, &a);
++                if (tbl) report_table_add(tbl, exe_path, pe.szExeFile,
++                                          "mapped PE in private memory",
++                                          ENTRY_FLAGGED, a.description);
++                flagged++;
++            }
++
++            /* Tier 2 -- thread entry point inside private executable memory:
++               classic CreateRemoteThread / QueueUserAPC shellcode marker. */
++            if (mf.thread_in_priv) {
++                Alert a = {0};
++                a.type      = ALERT_INJECTED_THREAD;
++                a.severity  = SEV_CRITICAL;
++                a.timestamp = time(NULL);
++                a.pid       = pid;
++                strncpy(a.process_name, pe.szExeFile, MAX_PATH - 1);
++                if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
++                strncpy(a.technique_id, "T1055.003", sizeof(a.technique_id) - 1);
++                snprintf(a.description, MAX_DESCRIPTION,
++                         "Thread start address 0x%llx in private executable memory of "
++                         "%s (pid=%lu) -- possible remote-thread injection",
++                         (unsigned long long)mf.thread_addr, pe.szExeFile, pid);
++                report_add(rep, &a);
++                ids_log_alert(cfg, &a);
++                if (tbl) report_table_add(tbl, exe_path, pe.szExeFile,
++                                          "thread entry in private memory",
++                                          ENTRY_FLAGGED, a.description);
++                flagged++;
++            }
++
++            /* Tier 3 -- plain RWX with no PE / thread evidence. JIT hosts
++               are recorded as evidence only; everything else gets a single
++               MEDIUM summary alert instead of one HIGH per region. */
++            if (!mf.pe_found && !mf.thread_in_priv && mf.rwx > 0 && !cfg->memory_strict) {
++                char detail[128];
++                snprintf(detail, sizeof(detail),
++                         "%d RWX region(s), largest %zu KB, first @ 0x%llx",
++                         mf.rwx, (size_t)(mf.largest / 1024),
++                         (unsigned long long)mf.first_hit);
++
++                if (jit) {
++                    if (tbl) report_table_add(tbl, exe_path, pe.szExeFile, detail,
++                                              ENTRY_OK, "known JIT/CLR host");
++                } else {
++                    Alert a = {0};
++                    a.type      = ALERT_MEMORY_ANOMALY;
++                    a.severity  = SEV_MEDIUM;
++                    a.timestamp = time(NULL);
++                    a.pid       = pid;
++                    strncpy(a.process_name, pe.szExeFile, MAX_PATH - 1);
++                    if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
++                    strncpy(a.technique_id, "T1055", sizeof(a.technique_id) - 1);
++                    snprintf(a.description, MAX_DESCRIPTION,
++                             "%s (pid=%lu): %s -- no mapped PE or thread evidence, "
++                             "unclassified private RWX",
++                             pe.szExeFile, pid, detail);
++                    report_add(rep, &a);
++                    ids_log_alert(cfg, &a);
++                    if (tbl) report_table_add(tbl, exe_path, pe.szExeFile, detail,
++                                              ENTRY_WARN, "unclassified RWX, no PE/thread evidence");
++                    flagged++;
++                }
++            }
++
+         } while (Process32Next(snap, &pe));
+     }
+ 
+     CloseHandle(snap);
+ 
+     if (tbl && flagged == 0)
+-        report_table_add(tbl, "", "memory", "RWX private-region scan",
++        report_table_add(tbl, "", "memory", "RWX / injection triage",
+                          ENTRY_OK, "no injected-code footprint found");
+ 
+     LOG_INFO("scan: memory -- done  total=%d  scanned=%d  denied=%d  flagged=%d",
+              total, scanned, denied, flagged);
+ }
++
+diff --git a/src/network.c b/src/network.c
+index 6141ea1..0c40251 100644
+--- a/src/network.c
++++ b/src/network.c
+@@ -3,28 +3,34 @@
+  *
+  * Takes a one-shot snapshot of all active TCP and UDP endpoints,
+  * correlates each with the owning process, and flags:
+- *   - Connections to/from blocked IPs
++ *   - Connections to/from blocked IPs (exact match or CIDR block)
+  *   - Connections on suspicious ports
+  *   - Processes connecting from staging paths (Temp, AppData, Downloads)
+  *   - Listening ports on non-standard interfaces
++ *   - Beaconing: repeated outbound connections to the same remote endpoint
++ *     from a process running out of a staging directory
+  *
+  * No threads, no polling. Called once by run_scan, returns.
+  */
+ #include "../include/ids.h"
+ #include "../include/report.h"
+ 
+-/* User-writable paths that legitimate software rarely runs from */
+-static const char *STAGING_PATHS[] = {
+-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+-    "\\downloads\\", "\\desktop\\", "\\public\\",
+-    NULL
+-};
+-
+-/* Well-known legitimate listening ports (not flagged as unknown service) */
++/* Well-known legitimate listening ports (not flagged as unknown service).
++ * v0.1 only whitelisted a handful of TCP ports and applied the same short
++ * list to UDP, so routine Windows services -- NTP client (123), NetBIOS
++ * Name/Datagram (137/138), DHCP (67/68), SSDP (1900), LLMNR (5355),
++ * mDNS (5353), WS-Discovery (3702) and IKE/IPsec (500/4500) -- lit up as
++ * UNKNOWN_SERVICE on every scan. Those are now whitelisted by default. */
+ static const WORD KNOWN_PORTS[] = {
+-    80, 443, 135, 139, 445, 3389, 5040, 7680, 0
++    80, 443, 135, 139, 445, 3389, 5040, 7680,
++    67, 68, 123, 137, 138, 500, 1900, 3702, 4500, 5353, 5355,
++    0
+ };
+ 
++/* Minimum window between repeated connections to the same remote endpoint
++   before it counts as beacon-like activity (see beacon tracker below). */
++#define BEACON_MIN_HITS   4
++
+ /* -----------------------------------------------
+    PID -> process name cache
+    ----------------------------------------------- */
+@@ -74,32 +80,17 @@ static const PidEntry *pid_lookup(DWORD pid) {
+ /* -----------------------------------------------
+    Helpers
+    ----------------------------------------------- */
+-static BOOL is_blocked(IdsConfig *cfg, const char *ip) {
+-    for (int i = 0; i < cfg->blocked_ip_count; i++)
+-        if (strcmp(cfg->blocked_ips[i], ip) == 0) return TRUE;
+-    return FALSE;
+-}
+-
+ static BOOL is_suspicious_port(IdsConfig *cfg, WORD port) {
+     for (int i = 0; i < cfg->suspicious_port_count; i++)
+         if (cfg->suspicious_ports[i] == port) return TRUE;
+     return FALSE;
+ }
+ 
+-static BOOL is_known_port(WORD port) {
++static BOOL is_known_port(IdsConfig *cfg, WORD port) {
+     for (int i = 0; KNOWN_PORTS[i]; i++)
+         if (KNOWN_PORTS[i] == port) return TRUE;
+-    return FALSE;
+-}
+-
+-static BOOL is_staging_path(const char *path) {
+-    char low[MAX_PATH];
+-    size_t len = strlen(path);
+-    if (len >= MAX_PATH) len = MAX_PATH - 1;
+-    memcpy(low, path, len); low[len] = '\0';
+-    for (char *p = low; *p; p++) *p = (char)tolower((unsigned char)*p);
+-    for (int i = 0; STAGING_PATHS[i]; i++)
+-        if (strstr(low, STAGING_PATHS[i])) return TRUE;
++    for (int i = 0; i < cfg->known_udp_port_count; i++)
++        if (cfg->known_udp_ports[i] == port) return TRUE;
+     return FALSE;
+ }
+ 
+@@ -146,6 +137,39 @@ static void emit(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl,
+                                ENTRY_FLAGGED, a.description);
+ }
+ 
++/* -----------------------------------------------
++   Per-process distinct remote-endpoint tracker (single-snapshot heuristic).
++   Narsil is scan-only -- one process, no threads, no state across runs --
++   so real time-series beacon detection (fixed-interval callbacks) is out
++   of reach. What one TCP snapshot *can* show is a staging-path process
++   holding many simultaneous connections to distinct external IPs, which is
++   the static signature of a multi-channel C2 client or an active scanner.
++   ----------------------------------------------- */
++#define BEACON_CAP        256
++#define BEACON_MAX_REMOTE 32
++typedef struct {
++    DWORD pid;
++    char  remote[BEACON_MAX_REMOTE][MAX_IP_LEN];
++    int   n;
++} BeaconTrack;
++static BeaconTrack g_beacon[BEACON_CAP];
++static int         g_beacon_n = 0;
++
++static void beacon_note(DWORD pid, const char *remote_ip) {
++    BeaconTrack *t = NULL;
++    for (int i = 0; i < g_beacon_n; i++)
++        if (g_beacon[i].pid == pid) { t = &g_beacon[i]; break; }
++    if (!t) {
++        if (g_beacon_n >= BEACON_CAP) return;
++        t = &g_beacon[g_beacon_n++];
++        t->pid = pid; t->n = 0;
++    }
++    for (int i = 0; i < t->n; i++)
++        if (strcmp(t->remote[i], remote_ip) == 0) return;   /* already counted */
++    if (t->n < BEACON_MAX_REMOTE)
++        strncpy(t->remote[t->n++], remote_ip, MAX_IP_LEN - 1);
++}
++
+ /* -----------------------------------------------
+    TCP snapshot
+    ----------------------------------------------- */
+@@ -191,7 +215,7 @@ static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
+         report_table_add(tbl, path, name, detail, ENTRY_OK, "");
+ 
+         /* Checks */
+-        if (is_blocked(cfg, dst)) {
++        if (narsil_ip_blocked(cfg, dst)) {
+             emit(cfg, rep, tbl, ALERT_BLOCKED_IP, SEV_CRITICAL,
+                  src, sport, dst, dport, pid, name, "T1071",
+                  "Connection to blocked IP %s:%u by %s (pid=%lu)",
+@@ -204,13 +228,15 @@ static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
+                  "Connection to suspicious port %u by %s (pid=%lu)",
+                  dport, name, pid);
+         }
+-        if (path[0] && is_staging_path(path) &&
++        if (path[0] && narsil_is_staging_path(path) &&
+             row->dwState == MIB_TCP_STATE_ESTAB && !is_loopback(dst)) {
+             emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, SEV_HIGH,
+                  src, sport, dst, dport, pid, name, "T1059",
+                  "Process in staging path has active connection: %s -> %s:%u",
+                  path, dst, dport);
+         }
++        if (row->dwState == MIB_TCP_STATE_ESTAB && !is_loopback(dst))
++            beacon_note(pid, dst);
+     }
+     free(table);
+ }
+@@ -258,7 +284,7 @@ static void scan_udp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
+                  "UDP listener on suspicious port %u by %s (pid=%lu)",
+                  port, name, pid);
+         }
+-        if (!is_loopback(local) && !is_known_port(port) && port < 1024) {
++        if (!is_loopback(local) && !is_known_port(cfg, port) && port < 1024) {
+             emit(cfg, rep, tbl, ALERT_UNKNOWN_SERVICE, SEV_MEDIUM,
+                  local, port, NULL, 0, pid, name, NULL,
+                  "Unknown UDP service on port %u by %s (pid=%lu)",
+@@ -281,12 +307,31 @@ void ids_scan_network(IdsConfig *cfg, ScanReport *rep) {
+     }
+ 
+     pid_cache_build();
++    g_beacon_n = 0;
+ 
+     EvidenceTable *tbl = report_table_begin(rep, "network");
+ 
+     scan_tcp(cfg, rep, tbl);
+     scan_udp(cfg, rep, tbl);
+ 
++    /* Multi-endpoint heuristic: a staging-path process holding several
++       simultaneous connections to distinct external hosts. */
++    for (int i = 0; i < g_beacon_n; i++) {
++        BeaconTrack *t = &g_beacon[i];
++        if (t->n < BEACON_MIN_HITS) continue;
++
++        const PidEntry *pe = pid_lookup(t->pid);
++        const char *name = pe ? pe->name : "?";
++        const char *path = pe ? pe->path : "";
++        if (!path[0] || !narsil_is_staging_path(path)) continue;
++
++        emit(cfg, rep, tbl, ALERT_C2_BEACON, SEV_HIGH,
++             "", 0, t->remote[0], 0, t->pid, name, "T1071",
++             "Process in staging path holds %d simultaneous connections to "
++             "distinct external hosts (first: %s) -- possible multi-channel C2",
++             t->n, t->remote[0]);
++    }
++
+     WSACleanup();
+     LOG_INFO("scan: network -- done  connections=%d  flagged=%d",
+              tbl->count, tbl->flagged_count);
+diff --git a/src/persistence.c b/src/persistence.c
+index a682f29..abecdef 100644
+--- a/src/persistence.c
++++ b/src/persistence.c
+@@ -16,28 +16,10 @@
+ #include "../include/ids.h"
+ #include "../include/report.h"
+ 
+-/* User-writable paths legitimate autostart entries rarely point at. */
+-static const char *STAGING[] = {
+-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+-    "\\downloads\\", "\\desktop\\", "\\public\\",
+-    NULL
+-};
+-
+ static void to_lower(char *s) {
+     for (; *s; s++) *s = (char)tolower((unsigned char)*s);
+ }
+ 
+-static BOOL is_staging(const char *path) {
+-    char low[MAX_PATH];
+-    size_t len = strlen(path);
+-    if (len >= MAX_PATH) len = MAX_PATH - 1;
+-    memcpy(low, path, len); low[len] = '\0';
+-    to_lower(low);
+-    for (int i = 0; STAGING[i]; i++)
+-        if (strstr(low, STAGING[i])) return TRUE;
+-    return FALSE;
+-}
+-
+ /* Pull the executable path out of a command line:
+    "C:\a b\x.exe" -foo   ->  C:\a b\x.exe
+    C:\a\x.exe -foo        ->  C:\a\x.exe
+@@ -111,7 +93,7 @@ static void inspect_target(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl,
+     char detail[MAX_PATH];
+     snprintf(detail, sizeof(detail), "%s -> %s", origin, command);
+ 
+-    if (exe[0] && is_staging(exe)) {
++    if (exe[0] && narsil_is_staging_path(exe)) {
+         emit(cfg, rep, tbl, SEV_HIGH, mitre, name, exe, ENTRY_FLAGGED,
+              "autostart from staging path",
+              "Persistence via %s: '%s' runs %s (staging path)",
+@@ -242,7 +224,7 @@ static void scan_services(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
+             char exe[MAX_PATH] = {0};
+             extract_exe(binpath, exe, sizeof(exe));
+ 
+-            if (exe[0] && is_staging(exe)) {
++            if (exe[0] && narsil_is_staging_path(exe)) {
+                 emit(cfg, rep, tbl, SEV_HIGH, "T1543", sname, exe, ENTRY_FLAGGED,
+                      "service binary in staging path",
+                      "Service '%s' runs from staging path: %s", sname, exe);
+diff --git a/src/process.c b/src/process.c
+index c8365d0..c6486b3 100644
+--- a/src/process.c
++++ b/src/process.c
+@@ -3,17 +3,16 @@
+  *
+  * For every running process, checks:
+  *   1. Name against known-bad list (tier 1)
+- *   2. Executable path — staging directories (tier 2)
+- *   3. Authenticode signature (tier 3)
+- *   4. Parent-child anomalies (Office/browser -> shell)
+- *   5. Integrity level (LOW = sandboxed/suspicious if not browser)
++ *   2. Command line against the suspicious pattern table (tier 2, v0.2)
++ *   3. Parent-child anomalies (Office/browser -> shell) (tier 3)
++ *   4. Executable path — staging directories (tier 4)
++ *   5. Authenticode signature (tier 5)
++ *   6. Integrity level (LOW = sandboxed/suspicious if not browser)
+  *
+  * No threads. Called once by run_scan, returns.
+  */
+ #include "../include/ids.h"
+ #include "../include/report.h"
+-#include <wintrust.h>
+-#include <softpub.h>
+ 
+ /* -----------------------------------------------
+    Tier 1 — known-bad process names
+@@ -47,58 +46,6 @@ static const ParentChildRule PC_RULES[] = {
+     { NULL, NULL, 0, NULL }
+ };
+ 
+-/* Staging paths */
+-static const char *STAGING[] = {
+-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+-    "\\downloads\\", "\\desktop\\", "\\public\\",
+-    NULL
+-};
+-
+-/* -----------------------------------------------
+-   Authenticode signature cache
+-   ----------------------------------------------- */
+-#define SIG_CACHE_CAP 512
+-typedef enum { SIG_VALID, SIG_UNSIGNED, SIG_INVALID } SigStatus;
+-typedef struct { char path[MAX_PATH]; SigStatus status; } SigCacheEntry;
+-static SigCacheEntry g_sig[SIG_CACHE_CAP];
+-static int           g_sig_n = 0;
+-
+-static SigStatus sig_verify(const char *path) {
+-    /* Cache lookup */
+-    for (int i = 0; i < g_sig_n; i++)
+-        if (_stricmp(g_sig[i].path, path) == 0) return g_sig[i].status;
+-
+-    wchar_t wp[MAX_PATH] = {0};
+-    MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH);
+-
+-    WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof(fi));
+-    fi.cbStruct = sizeof(fi); fi.pcwszFilePath = wp;
+-
+-    WINTRUST_DATA wd; memset(&wd, 0, sizeof(wd));
+-    wd.cbStruct            = sizeof(wd);
+-    wd.dwUnionChoice       = WTD_CHOICE_FILE;
+-    wd.pFile               = &fi;
+-    wd.dwUIChoice          = WTD_UI_NONE;
+-    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+-    wd.dwStateAction       = WTD_STATEACTION_VERIFY;
+-    wd.dwProvFlags         = WTD_SAFER_FLAG;
+-
+-    GUID guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+-    LONG rc   = WinVerifyTrust(NULL, &guid, &wd);
+-    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+-    WinVerifyTrust(NULL, &guid, &wd);
+-
+-    SigStatus s = (rc == ERROR_SUCCESS)       ? SIG_VALID   :
+-                  (rc == TRUST_E_NOSIGNATURE)  ? SIG_UNSIGNED:
+-                                                 SIG_INVALID;
+-    if (g_sig_n < SIG_CACHE_CAP) {
+-        strncpy(g_sig[g_sig_n].path, path, MAX_PATH - 1);
+-        g_sig[g_sig_n].status = s;
+-        g_sig_n++;
+-    }
+-    return s;
+-}
+-
+ /* -----------------------------------------------
+    Integrity level of a process
+    ----------------------------------------------- */
+@@ -128,25 +75,6 @@ static const char *get_integrity(DWORD pid) {
+ /* -----------------------------------------------
+    Helpers
+    ----------------------------------------------- */
+-static BOOL is_staging(const char *path) {
+-    char low[MAX_PATH];
+-    size_t len = strlen(path);
+-    if (len >= MAX_PATH) len = MAX_PATH - 1;
+-    memcpy(low, path, len); low[len] = '\0';
+-    for (char *p = low; *p; p++) *p = (char)tolower((unsigned char)*p);
+-    for (int i = 0; STAGING[i]; i++)
+-        if (strstr(low, STAGING[i])) return TRUE;
+-    return FALSE;
+-}
+-
+-static void get_exe_path(DWORD pid, char *out, DWORD out_sz) {
+-    out[0] = '\0';
+-    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+-    if (!hp) return;
+-    QueryFullProcessImageNameA(hp, 0, out, &out_sz);
+-    CloseHandle(hp);
+-}
+-
+ static void get_parent_name(DWORD parent_pid, char *out) {
+     out[0] = '\0';
+     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+@@ -229,7 +157,7 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
+             continue;
+         }
+ 
+-        get_exe_path(pid, path, MAX_PATH);
++        narsil_get_exe_path(pid, path, MAX_PATH);
+         get_parent_name(pe.th32ParentProcessID, parent_name);
+ 
+         /* Lowercase name for comparison */
+@@ -254,7 +182,23 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
+         }
+         if (bad) continue;
+ 
+-        /* Tier 2 — parent-child anomaly */
++        /* Tier 2 — command-line pattern match (v0.2). Cross-process
++           command-line retrieval is best-effort (see narsil_get_cmdline);
++           silently skipped if the PEB read fails. */
++        char cmdline[512] = {0};
++        if (narsil_get_cmdline(pid, cmdline, sizeof(cmdline))) {
++            const NarsilPattern *m = narsil_match_pattern(cmdline);
++            if (m) {
++                emit(cfg, rep, tbl, ALERT_SUSPICIOUS_CMDLINE, m->sev,
++                     pid, name, path, m->mitre, ENTRY_FLAGGED,
++                     "%s: %s (pid=%lu) cmdline: %.200s",
++                     m->why, name, pid, cmdline);
++                bad = TRUE; flagged++;
++            }
++        }
++        if (bad) continue;
++
++        /* Tier 3 — parent-child anomaly */
+         char lower_parent[MAX_PATH] = {0};
+         strncpy(lower_parent, parent_name, MAX_PATH - 1);
+         for (char *p = lower_parent; *p; p++) *p = (char)tolower((unsigned char)*p);
+@@ -272,25 +216,23 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
+         }
+         if (bad) continue;
+ 
+-        /* Tier 3 — staging path */
+-        if (path[0] && is_staging(path)) {
+-            SigStatus sig = sig_verify(path);
+-            Severity  sev = (sig == SIG_INVALID)  ? SEV_CRITICAL :
+-                            (sig == SIG_UNSIGNED)  ? SEV_HIGH     : SEV_MEDIUM;
+-            const char *sig_str = (sig == SIG_VALID)   ? "signed"   :
+-                                  (sig == SIG_UNSIGNED) ? "unsigned" : "tampered";
++        /* Tier 4 — staging path */
++        if (path[0] && narsil_is_staging_path(path)) {
++            NarsilSig sig = narsil_sig_verify(path);
++            Severity  sev = (sig == NSIG_INVALID)  ? SEV_CRITICAL :
++                            (sig == NSIG_UNSIGNED)  ? SEV_HIGH     : SEV_MEDIUM;
+             emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, sev,
+                  pid, name, path, "T1059", ENTRY_FLAGGED,
+                  "Process in staging path (%s sig): %.64s  integrity=%s",
+-                 sig_str, path, get_integrity(pid));
++                 narsil_sig_str(sig), path, get_integrity(pid));
+             flagged++;
+             continue;
+         }
+ 
+-        /* Tier 4 — unsigned binary outside staging (lower severity) */
++        /* Tier 5 — unsigned binary outside staging (lower severity) */
+         if (path[0]) {
+-            SigStatus sig = sig_verify(path);
+-            if (sig == SIG_INVALID) {
++            NarsilSig sig = narsil_sig_verify(path);
++            if (sig == NSIG_INVALID) {
+                 emit(cfg, rep, tbl, ALERT_SUSPICIOUS_PROCESS, SEV_HIGH,
+                      pid, name, path, "T1036", ENTRY_FLAGGED,
+                      "Tampered binary: %.64s  integrity=%s",
+@@ -298,8 +240,8 @@ void ids_scan_processes(IdsConfig *cfg, ScanReport *rep,
+                 flagged++;
+                 continue;
+             }
+-            const char *sig_str = (sig == SIG_VALID) ? "signed (embedded/catalog)"
+-                                                      : "unsigned";
++            const char *sig_str = (sig == NSIG_VALID) ? "signed (embedded/catalog)"
++                                                        : "unsigned";
+             report_table_add(tbl, path, name, sig_str, ENTRY_OK, "");
+         } else {
+             report_table_add(tbl, "", name, "path unavailable", ENTRY_OK, "");
+diff --git a/src/report.c b/src/report.c
+index 69062c9..a633903 100644
+--- a/src/report.c
++++ b/src/report.c
+@@ -49,6 +49,7 @@ void report_free(ScanReport *r) { if (r) free(r); }
+    ----------------------------------------------- */
+ void report_add(ScanReport *r, const Alert *a) {
+     if (!r || !a) return;
++    if (g_active_cfg && ids_alert_suppressed(g_active_cfg, a)) return;
+     if (r->count >= REPORT_MAX_ALERTS) {
+         LOG_WARN("report_add: buffer full (%d), dropping alert", REPORT_MAX_ALERTS);
+         return;
+diff --git a/src/util.c b/src/util.c
+new file mode 100644
+index 0000000..3b8efa6
+--- /dev/null
++++ b/src/util.c
+@@ -0,0 +1,341 @@
++/*
++ * util.c -- Shared helpers for Narsil scan modules (v0.2).
++ *
++ * Before v0.2 the staging-path check, case-insensitive search, executable
++ * path resolution and Authenticode verification were copy-pasted across
++ * process.c, network.c, persistence.c and kernel.c. They now live here so a
++ * fix (or a new staging directory) only has to be made once.
++ *
++ * This file also owns the suspicious command-line / script pattern table
++ * used by both process.c (live command lines) and events.c (4688 records).
++ */
++#include "../include/ids.h"
++#include <wintrust.h>
++#include <softpub.h>
++#include <mscat.h>
++
++/* -----------------------------------------------
++   User-writable staging directories. Legitimate signed software very
++   rarely executes from here; malware droppers almost always do.
++   ----------------------------------------------- */
++static const char *STAGING_DIRS[] = {
++    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
++    "\\downloads\\", "\\desktop\\", "\\public\\",
++    "\\programdata\\", "\\$recycle.bin\\",
++    "\\appdata\\roaming\\", "\\music\\", "\\pictures\\", "\\videos\\",
++    NULL
++};
++
++/* Case-insensitive substring search (ASCII). Returns pointer into hay. */
++const char *narsil_stristr(const char *hay, const char *needle) {
++    if (!hay || !needle || !*needle) return NULL;
++    for (; *hay; hay++) {
++        const char *h = hay, *n = needle;
++        while (*h && *n &&
++               tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
++            h++; n++;
++        }
++        if (!*n) return hay;
++    }
++    return NULL;
++}
++
++/* Lowercase copy, always NUL-terminated, never overruns dst. */
++void narsil_lower_copy(char *dst, const char *src, size_t dst_len) {
++    if (dst_len == 0) return;
++    size_t i = 0;
++    for (; src && src[i] && i < dst_len - 1; i++)
++        dst[i] = (char)tolower((unsigned char)src[i]);
++    dst[i] = '\0';
++}
++
++BOOL narsil_is_staging_path(const char *path) {
++    if (!path || !path[0]) return FALSE;
++    char low[MAX_PATH];
++    narsil_lower_copy(low, path, sizeof(low));
++    for (int i = 0; STAGING_DIRS[i]; i++)
++        if (strstr(low, STAGING_DIRS[i])) return TRUE;
++    return FALSE;
++}
++
++void narsil_get_exe_path(DWORD pid, char *out, DWORD out_sz) {
++    if (out_sz == 0) return;
++    out[0] = '\0';
++    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++    if (!hp) return;
++    DWORD sz = out_sz;
++    QueryFullProcessImageNameA(hp, 0, out, &sz);
++    CloseHandle(hp);
++}
++
++/* -----------------------------------------------
++   Cross-process command-line retrieval.
++   Toolhelp/NtQSI only give an image name, not the arguments an attacker
++   actually cares about (encoded PowerShell, LOLBin flags, ...). This walks
++   NtQueryInformationProcess -> PEB -> RTL_USER_PROCESS_PARAMETERS via
++   ReadProcessMemory, which needs no COM/WMI dependency.
++   64-bit target processes only: a 32-bit target under WOW64 has a second,
++   32-bit PEB at a different address that this does not follow. Any failure
++   (denied handle, WOW64 mismatch, exited process) yields an empty string,
++   matching the "best effort" convention used by narsil_get_exe_path().
++   ----------------------------------------------- */
++typedef struct _NARSIL_PROCESS_BASIC_INFORMATION {
++    PVOID Reserved1;
++    PVOID PebBaseAddress;
++    PVOID Reserved2[2];
++    ULONG_PTR UniqueProcessId;
++    PVOID Reserved3;
++} NARSIL_PROCESS_BASIC_INFORMATION;
++
++typedef LONG (WINAPI *PFN_NtQueryInformationProcess)(
++    HANDLE, ULONG, PVOID, ULONG, PULONG);
++
++BOOL narsil_get_cmdline(DWORD pid, char *out, size_t out_len) {
++    if (out_len == 0) return FALSE;
++    out[0] = '\0';
++
++    static PFN_NtQueryInformationProcess NtQIP = NULL;
++    static BOOL tried = FALSE;
++    if (!tried) {
++        tried = TRUE;
++        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
++        if (ntdll)
++            NtQIP = (PFN_NtQueryInformationProcess)(void *)
++                    GetProcAddress(ntdll, "NtQueryInformationProcess");
++    }
++    if (!NtQIP) return FALSE;
++
++    HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
++                            FALSE, pid);
++    if (!hp) return FALSE;
++
++    NARSIL_PROCESS_BASIC_INFORMATION pbi = {0};
++    ULONG ret_len = 0;
++    if (NtQIP(hp, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), &ret_len) != 0
++        || !pbi.PebBaseAddress) {
++        CloseHandle(hp);
++        return FALSE;
++    }
++
++    /* PEB->ProcessParameters is at offset 0x20 on 64-bit Windows. */
++    PVOID proc_params = NULL;
++    if (!ReadProcessMemory(hp, (BYTE *)pbi.PebBaseAddress + 0x20,
++                           &proc_params, sizeof(proc_params), NULL) || !proc_params) {
++        CloseHandle(hp);
++        return FALSE;
++    }
++
++    /* RTL_USER_PROCESS_PARAMETERS->CommandLine (UNICODE_STRING) is at
++       offset 0x70 on 64-bit Windows. */
++    struct { USHORT Length; USHORT MaximumLength; PVOID Buffer; } cmdline_us = {0};
++    if (!ReadProcessMemory(hp, (BYTE *)proc_params + 0x70,
++                           &cmdline_us, sizeof(cmdline_us), NULL) ||
++        !cmdline_us.Buffer || cmdline_us.Length == 0) {
++        CloseHandle(hp);
++        return FALSE;
++    }
++
++    WCHAR wbuf[1024] = {0};
++    USHORT wlen = cmdline_us.Length;
++    if (wlen >= sizeof(wbuf)) wlen = sizeof(wbuf) - sizeof(WCHAR);
++    if (!ReadProcessMemory(hp, cmdline_us.Buffer, wbuf, wlen, NULL)) {
++        CloseHandle(hp);
++        return FALSE;
++    }
++    CloseHandle(hp);
++
++    WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen / (int)sizeof(WCHAR),
++                        out, (int)out_len - 1, NULL, NULL);
++    return out[0] != '\0';
++}
++
++/* -----------------------------------------------
++   Authenticode verification with catalog fallback + a small cache.
++   Most inbox Windows binaries are catalog-signed (.cat), for which
++   WinVerifyTrust alone returns TRUST_E_NOSIGNATURE; the catalog lookup is
++   the authoritative second check.
++   ----------------------------------------------- */
++#define SIG_CACHE_CAP 1024
++typedef struct { char path[MAX_PATH]; NarsilSig status; } SigCacheEntry;
++static SigCacheEntry g_sig[SIG_CACHE_CAP];
++static int           g_sig_n = 0;
++
++static BOOL catalog_signed(const wchar_t *wpath) {
++    HANDLE hFile = CreateFileW(wpath, GENERIC_READ,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                               NULL, OPEN_EXISTING, 0, NULL);
++    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
++
++    HCATADMIN hAdmin = NULL;
++    GUID action = DRIVER_ACTION_VERIFY;
++    if (!CryptCATAdminAcquireContext(&hAdmin, &action, 0)) {
++        CloseHandle(hFile);
++        return FALSE;
++    }
++
++    DWORD hashLen = 0;
++    CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, NULL, 0);
++
++    BOOL found = FALSE;
++    if (hashLen > 0) {
++        BYTE *hash = (BYTE *)malloc(hashLen);
++        if (hash) {
++            if (CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hash, 0)) {
++                HCATINFO hInfo = CryptCATAdminEnumCatalogFromHash(
++                                     hAdmin, hash, hashLen, 0, NULL);
++                if (hInfo) {
++                    found = TRUE;
++                    CryptCATAdminReleaseCatalogContext(hAdmin, hInfo, 0);
++                }
++            }
++            free(hash);
++        }
++    }
++    CloseHandle(hFile);
++    CryptCATAdminReleaseContext(hAdmin, 0);
++    return found;
++}
++
++NarsilSig narsil_sig_verify(const char *path) {
++    if (!path || !path[0]) return NSIG_UNSIGNED;
++
++    for (int i = 0; i < g_sig_n; i++)
++        if (_stricmp(g_sig[i].path, path) == 0) return g_sig[i].status;
++
++    wchar_t wp[MAX_PATH] = {0};
++    MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH);
++
++    WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof(fi));
++    fi.cbStruct = sizeof(fi); fi.pcwszFilePath = wp;
++
++    WINTRUST_DATA wd; memset(&wd, 0, sizeof(wd));
++    wd.cbStruct            = sizeof(wd);
++    wd.dwUnionChoice       = WTD_CHOICE_FILE;
++    wd.pFile               = &fi;
++    wd.dwUIChoice          = WTD_UI_NONE;
++    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
++    wd.dwStateAction       = WTD_STATEACTION_VERIFY;
++    wd.dwProvFlags         = WTD_SAFER_FLAG;
++
++    GUID guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
++    LONG rc   = WinVerifyTrust(NULL, &guid, &wd);
++    wd.dwStateAction = WTD_STATEACTION_CLOSE;
++    WinVerifyTrust(NULL, &guid, &wd);
++
++    NarsilSig s;
++    if (rc == ERROR_SUCCESS)               s = NSIG_VALID;
++    else if (rc == TRUST_E_NOSIGNATURE)    s = catalog_signed(wp) ? NSIG_VALID : NSIG_UNSIGNED;
++    else                                   s = NSIG_INVALID;
++
++    if (g_sig_n < SIG_CACHE_CAP) {
++        strncpy(g_sig[g_sig_n].path, path, MAX_PATH - 1);
++        g_sig[g_sig_n].status = s;
++        g_sig_n++;
++    }
++    return s;
++}
++
++const char *narsil_sig_str(NarsilSig s) {
++    switch (s) {
++        case NSIG_VALID:    return "signed";
++        case NSIG_UNSIGNED: return "unsigned";
++        default:            return "tampered";
++    }
++}
++
++/* -----------------------------------------------
++   Suspicious command-line / script pattern table.
++   Ordered most-specific first; narsil_match_pattern returns the first hit
++   so a strong indicator (encoded PowerShell) wins over a weak one.
++   ----------------------------------------------- */
++static const NarsilPattern PATTERNS[] = {
++    /* --- PowerShell abuse (T1059.001 / T1027) --- */
++    { "-encodedcommand",        SEV_HIGH,     "T1027",     "encoded PowerShell command" },
++    { "-enc ",                  SEV_HIGH,     "T1027",     "encoded PowerShell command" },
++    { "-e jab",                 SEV_HIGH,     "T1027",     "base64 PowerShell (JAB...)" },
++    { "frombase64string",       SEV_HIGH,     "T1140",     "inline base64 decode" },
++    { "-nop ",                  SEV_MEDIUM,   "T1059.001", "PowerShell -NoProfile" },
++    { "-noprofile",             SEV_MEDIUM,   "T1059.001", "PowerShell -NoProfile" },
++    { "-windowstyle hidden",    SEV_HIGH,     "T1564.003", "hidden window" },
++    { "-w hidden",              SEV_HIGH,     "T1564.003", "hidden window" },
++    { "iex(",                   SEV_HIGH,     "T1059.001", "Invoke-Expression" },
++    { "invoke-expression",      SEV_HIGH,     "T1059.001", "Invoke-Expression" },
++    { "downloadstring",         SEV_HIGH,     "T1105",     "in-memory download cradle" },
++    { "downloadfile",           SEV_MEDIUM,   "T1105",     "remote file download" },
++    { "invoke-webrequest",      SEV_MEDIUM,   "T1105",     "remote download cradle" },
++    { "net.webclient",          SEV_HIGH,     "T1105",     "WebClient download cradle" },
++    { "bypass",                 SEV_MEDIUM,   "T1059.001", "execution-policy bypass" },
++    { "-executionpolicy",       SEV_MEDIUM,   "T1059.001", "execution-policy override" },
++    { "hidden -e",              SEV_HIGH,     "T1027",     "hidden encoded command" },
++    /* --- LOLBins (T1218) --- */
++    { "mshta ",                 SEV_HIGH,     "T1218.005", "mshta script execution" },
++    { "regsvr32 ",              SEV_MEDIUM,   "T1218.010", "regsvr32 proxy execution" },
++    { "scrobj.dll",             SEV_HIGH,     "T1218.010", "regsvr32 scriptlet (squiblydoo)" },
++    { "rundll32 ",              SEV_MEDIUM,   "T1218.011", "rundll32 proxy execution" },
++    { "javascript:",            SEV_HIGH,     "T1218.011", "rundll32 javascript" },
++    { "certutil ",              SEV_MEDIUM,   "T1105",     "certutil download/decode" },
++    { "-decode",                SEV_HIGH,     "T1140",     "certutil -decode" },
++    { "-urlcache",              SEV_HIGH,     "T1105",     "certutil -urlcache download" },
++    { "bitsadmin ",             SEV_MEDIUM,   "T1197",     "BITS job abuse" },
++    { "/transfer",              SEV_MEDIUM,   "T1197",     "BITS transfer" },
++    { "wmic ",                  SEV_MEDIUM,   "T1047",     "WMI command execution" },
++    { "process call create",    SEV_HIGH,     "T1047",     "WMI process create" },
++    { "msiexec ",               SEV_LOW,      "T1218.007", "msiexec execution" },
++    { "installutil",            SEV_MEDIUM,   "T1218.004", "InstallUtil proxy execution" },
++    { "regasm",                 SEV_MEDIUM,   "T1218.009", "Regasm proxy execution" },
++    { "regsvcs",                SEV_MEDIUM,   "T1218.009", "Regsvcs proxy execution" },
++    /* --- Defense evasion / recon (T1562 / T1490) --- */
++    { "vssadmin delete",        SEV_CRITICAL, "T1490",     "shadow-copy deletion (ransomware)" },
++    { "wbadmin delete",         SEV_CRITICAL, "T1490",     "backup deletion (ransomware)" },
++    { "bcdedit",                SEV_HIGH,     "T1490",     "boot-config tampering" },
++    { "recoveryenabled no",     SEV_CRITICAL, "T1490",     "recovery disabled (ransomware)" },
++    { "cipher /w",              SEV_HIGH,     "T1485",     "secure data wipe" },
++    { "set-mppreference",       SEV_HIGH,     "T1562.001", "Defender tampering" },
++    { "add-mppreference",       SEV_HIGH,     "T1562.001", "Defender exclusion" },
++    { "disablerealtimemonitoring", SEV_CRITICAL, "T1562.001", "Defender realtime disabled" },
++    { "netsh advfirewall",      SEV_MEDIUM,   "T1562.004", "firewall tampering" },
++    { "wevtutil cl",            SEV_CRITICAL, "T1070.001", "event log cleared" },
++    { "clear-eventlog",         SEV_CRITICAL, "T1070.001", "event log cleared" },
++    { "fsutil usn deletejournal", SEV_HIGH,   "T1070",     "USN journal deletion" },
++    { "attrib +h +s",           SEV_MEDIUM,   "T1564.001", "hiding files" },
++    /* --- Credential access / lateral (T1003 / T1021) --- */
++    { "sekurlsa",               SEV_CRITICAL, "T1003.001", "Mimikatz lsass dump" },
++    { "lsadump",                SEV_CRITICAL, "T1003",     "Mimikatz LSA dump" },
++    { "comsvcs.dll",            SEV_HIGH,     "T1003.001", "MiniDump comsvcs lsass" },
++    { "minidump",               SEV_HIGH,     "T1003.001", "process memory dump" },
++    { "ntds.dit",               SEV_CRITICAL, "T1003.003", "NTDS credential theft" },
++    { "\\\\admin$",             SEV_HIGH,     "T1021.002", "admin share lateral movement" },
++    { "psexec",                 SEV_HIGH,     "T1569.002", "PsExec service execution" },
++    { "reg save hklm\\sam",     SEV_CRITICAL, "T1003.002", "SAM hive dump" },
++    { "whoami /priv",           SEV_LOW,      "T1033",     "privilege enumeration" },
++    { NULL, 0, NULL, NULL }
++};
++
++const NarsilPattern *narsil_match_pattern(const char *text) {
++    if (!text || !text[0]) return NULL;
++    char low[1024];
++    narsil_lower_copy(low, text, sizeof(low));
++    for (int i = 0; PATTERNS[i].pattern; i++)
++        if (strstr(low, PATTERNS[i].pattern)) return &PATTERNS[i];
++    return NULL;
++}
++
++/* -----------------------------------------------
++   Blocked-IP matching: exact string list (legacy) + CIDR ranges (v0.2).
++   ----------------------------------------------- */
++BOOL narsil_ip_blocked(IdsConfig *cfg, const char *ip) {
++    if (!ip || !ip[0]) return FALSE;
++
++    for (int i = 0; i < cfg->blocked_ip_count; i++)
++        if (strcmp(cfg->blocked_ips[i], ip) == 0) return TRUE;
++
++    if (cfg->blocked_net_count > 0) {
++        DWORD addr = inet_addr(ip);
++        if (addr != INADDR_NONE) {
++            for (int i = 0; i < cfg->blocked_net_count; i++)
++                if ((addr & cfg->blocked_nets[i].mask) == cfg->blocked_nets[i].net)
++                    return TRUE;
++        }
++    }
++    return FALSE;
++}
+-- 
+2.43.0
+
