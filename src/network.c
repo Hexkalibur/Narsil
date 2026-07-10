@@ -86,11 +86,17 @@ static BOOL is_suspicious_port(IdsConfig *cfg, WORD port) {
     return FALSE;
 }
 
-static BOOL is_known_port(IdsConfig *cfg, WORD port) {
+/* Protocol-aware: the built-in KNOWN_PORTS[] list applies to both
+   protocols; the operator-supplied extras are kept in separate TCP/UDP
+   arrays so a known_tcp_port entry never silences a UDP finding and
+   vice versa. */
+static BOOL is_known_port(IdsConfig *cfg, WORD port, BOOL is_udp) {
     for (int i = 0; KNOWN_PORTS[i]; i++)
         if (KNOWN_PORTS[i] == port) return TRUE;
-    for (int i = 0; i < cfg->known_udp_port_count; i++)
-        if (cfg->known_udp_ports[i] == port) return TRUE;
+    int n         = is_udp ? cfg->known_udp_port_count : cfg->known_tcp_port_count;
+    const WORD *p = is_udp ? cfg->known_udp_ports      : cfg->known_tcp_ports;
+    for (int i = 0; i < n; i++)
+        if (p[i] == port) return TRUE;
     return FALSE;
 }
 
@@ -215,6 +221,13 @@ static void scan_tcp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
         report_table_add(tbl, path, name, detail, ENTRY_OK, "");
 
         /* Checks */
+        if (row->dwState == MIB_TCP_STATE_LISTEN &&
+            !is_loopback(src) && !is_known_port(cfg, sport, FALSE) && sport < 1024) {
+            emit(cfg, rep, tbl, ALERT_UNKNOWN_SERVICE, SEV_MEDIUM,
+                 src, sport, NULL, 0, pid, name, NULL,
+                 "Unknown TCP service listening on port %u by %s (pid=%lu)",
+                 sport, name, pid);
+        }
         if (narsil_ip_blocked(cfg, dst)) {
             emit(cfg, rep, tbl, ALERT_BLOCKED_IP, SEV_CRITICAL,
                  src, sport, dst, dport, pid, name, "T1071",
@@ -284,7 +297,7 @@ static void scan_udp(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
                  "UDP listener on suspicious port %u by %s (pid=%lu)",
                  port, name, pid);
         }
-        if (!is_loopback(local) && !is_known_port(cfg, port) && port < 1024) {
+        if (!is_loopback(local) && !is_known_port(cfg, port, TRUE) && port < 1024) {
             emit(cfg, rep, tbl, ALERT_UNKNOWN_SERVICE, SEV_MEDIUM,
                  local, port, NULL, 0, pid, name, NULL,
                  "Unknown UDP service on port %u by %s (pid=%lu)",
