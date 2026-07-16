@@ -91,7 +91,7 @@ static void inspect_target(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl,
     extract_exe(command, exe, sizeof(exe));
 
     char detail[MAX_PATH];
-    snprintf(detail, sizeof(detail), "%s -> %s", origin, command);
+    snprintf(detail, sizeof(detail), "%.100s -> %.150s", origin, command);
 
     if (exe[0] && narsil_is_staging_path(exe)) {
         emit(cfg, rep, tbl, SEV_HIGH, mitre, name, exe, ENTRY_FLAGGED,

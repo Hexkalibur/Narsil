@@ -221,8 +221,8 @@ static void brute_finalize(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) 
         strncpy(a.source_ip, e->ip, MAX_IP_LEN - 1);
         strncpy(a.technique_id, "T1110", sizeof(a.technique_id) - 1);
         snprintf(a.description, MAX_DESCRIPTION,
-                 "Brute-force: %d failed logons within %ds from %s "
-                 "(peak %s -> %s, user=%s, %d total in window%s)",
+                 "Brute-force: %d failed logons within %ds from %.45s "
+                 "(peak %.19s -> %.19s, user=%.32s, %d total in window%s)",
                  best, BRUTE_WINDOW_SECS, e->ip, from_s, to_s,
                  e->user[0] ? e->user : "?", e->n,
                  e->dropped ? ", truncated" : "");

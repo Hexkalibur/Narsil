@@ -267,7 +267,7 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
                 if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
                 strncpy(a.technique_id, "T1055", sizeof(a.technique_id) - 1);
                 snprintf(a.description, MAX_DESCRIPTION,
-                         "%d private RWX region(s) in %s (pid=%lu), first @ 0x%llx",
+                         "%d private RWX region(s) in %.64s (pid=%lu), first @ 0x%llx",
                          mf.rwx, pe.szExeFile, pid, (unsigned long long)mf.first_hit);
                 report_add(rep, &a);
                 ids_log_alert(cfg, &a);
@@ -286,7 +286,7 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
                 if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
                 strncpy(a.technique_id, "T1055.001", sizeof(a.technique_id) - 1);
                 snprintf(a.description, MAX_DESCRIPTION,
-                         "Mapped PE image in private memory of %s (pid=%lu) @ 0x%llx "
+                         "Mapped PE image in private memory of %.64s (pid=%lu) @ 0x%llx "
                          "-- reflective DLL / process injection",
                          pe.szExeFile, pid, (unsigned long long)mf.pe_addr);
                 report_add(rep, &a);
@@ -310,7 +310,7 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
                 strncpy(a.technique_id, "T1055.003", sizeof(a.technique_id) - 1);
                 snprintf(a.description, MAX_DESCRIPTION,
                          "Thread start address 0x%llx in private executable memory of "
-                         "%s (pid=%lu) -- possible remote-thread injection",
+                         "%.64s (pid=%lu) -- possible remote-thread injection",
                          (unsigned long long)mf.thread_addr, pe.szExeFile, pid);
                 report_add(rep, &a);
                 ids_log_alert(cfg, &a);
@@ -343,7 +343,7 @@ void ids_scan_memory(IdsConfig *cfg, ScanReport *rep, const char *yara_rules) {
                     if (exe_path[0]) strncpy(a.file_path, exe_path, MAX_PATH - 1);
                     strncpy(a.technique_id, "T1055", sizeof(a.technique_id) - 1);
                     snprintf(a.description, MAX_DESCRIPTION,
-                             "%s (pid=%lu): %s -- no mapped PE or thread evidence, "
+                             "%.48s (pid=%lu): %.100s -- no mapped PE or thread evidence, "
                              "unclassified private RWX",
                              pe.szExeFile, pid, detail);
                     report_add(rep, &a);
