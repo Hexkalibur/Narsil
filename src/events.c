@@ -21,6 +21,7 @@
 #define BRUTE_THRESHOLD     5    /* failed logons within window = brute force */
 #define BRUTE_WINDOW_SECS 300    /* 5 minutes */
 #define MAX_EVENTS_READ   4096
+#define BRUTE_MAX_HITS     256   /* 4625 timestamps retained per source IP */
 
 /* Event IDs of interest */
 #define EVT_LOGON_FAILURE     4625
@@ -87,6 +88,38 @@ static BOOL xml_extract_data(const char *xml, const char *name,
     return FALSE;
 }
 
+/* Parse the record's own creation time out of
+     <TimeCreated SystemTime="2026-07-11T15:12:37.1234567Z"/>
+   The attribute is UTC, so _mkgmtime() (not mktime()) is the correct
+   conversion. Returns 0 when the attribute is missing or malformed; the
+   caller then falls back to the scan time. */
+static time_t xml_event_time(const char *xml) {
+    const char *p = strstr(xml, "<TimeCreated");
+    if (!p) return 0;
+    p = strstr(p, "SystemTime=");
+    if (!p) return 0;
+    p += 11;
+    if (*p != '"' && *p != '\'') return 0;
+    p++;
+
+    int Y = 0, M = 0, D = 0, h = 0, m = 0, s = 0;
+    if (sscanf(p, "%4d-%2d-%2dT%2d:%2d:%2d", &Y, &M, &D, &h, &m, &s) != 6)
+        return 0;
+
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = Y - 1900;
+    t.tm_mon  = M - 1;
+    t.tm_mday = D;
+    t.tm_hour = h;
+    t.tm_min  = m;
+    t.tm_sec  = s;
+    t.tm_isdst = 0;
+
+    time_t out = _mkgmtime(&t);
+    return (out == (time_t)-1) ? 0 : out;
+}
+
 /* -----------------------------------------------
    Render EVT_HANDLE to XML string
    ----------------------------------------------- */
@@ -101,10 +134,30 @@ static BOOL render_xml(EVT_HANDLE hEvent, char *buf, DWORD buf_len) {
 }
 
 /* -----------------------------------------------
-   Brute-force tracker (per source IP)
+   Brute-force tracker (per source IP).
+
+   The previous implementation counted 4625 records against time(NULL) --
+   the time of the *scan*, not of the events. Because a scan completes in
+   seconds, the "older than BRUTE_WINDOW_SECS" branch could never be taken,
+   so every failed logon in the whole lookback window (24h by default)
+   accumulated into a single bucket. Five failures spread over a day were
+   reported as "5 failed logons in 300s", which is both a false positive and
+   a false statement. Records also arrive newest-first
+   (EvtQueryReverseDirection), so no running counter can work regardless.
+
+   Instead we collect each record's own TimeCreated and, once both channels
+   have been read, slide a real BRUTE_WINDOW_SECS window over the sorted
+   timestamps to find the densest burst. That reports one alert per source
+   IP describing an interval that actually occurred.
    ----------------------------------------------- */
 #define BRUTE_CAP 128
-typedef struct { char ip[MAX_IP_LEN]; DWORD count; time_t first; } BruteEntry;
+typedef struct {
+    char   ip[MAX_IP_LEN];
+    char   user[128];            /* last TargetUserName seen for this IP */
+    time_t hits[BRUTE_MAX_HITS];
+    int    n;
+    int    dropped;              /* hits beyond BRUTE_MAX_HITS */
+} BruteEntry;
 static BruteEntry g_brute[BRUTE_CAP];
 static int        g_brute_n = 0;
 
@@ -113,9 +166,72 @@ static BruteEntry *brute_get(const char *ip) {
         if (strcmp(g_brute[i].ip, ip) == 0) return &g_brute[i];
     if (g_brute_n >= BRUTE_CAP) return NULL;
     BruteEntry *e = &g_brute[g_brute_n++];
+    memset(e, 0, sizeof(*e));
     strncpy(e->ip, ip, MAX_IP_LEN - 1);
-    e->count = 0; e->first = time(NULL);
     return e;
+}
+
+static void brute_note(const char *ip, const char *user, time_t when) {
+    BruteEntry *e = brute_get(ip);
+    if (!e) return;
+    if (user && user[0]) {
+        strncpy(e->user, user, sizeof(e->user) - 1);
+        e->user[sizeof(e->user) - 1] = '\0';
+    }
+    if (e->n < BRUTE_MAX_HITS) e->hits[e->n++] = when;
+    else                       e->dropped++;
+}
+
+static int cmp_time(const void *a, const void *b) {
+    time_t x = *(const time_t *)a, y = *(const time_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Slide a BRUTE_WINDOW_SECS window over the sorted timestamps and report
+   the densest burst per source IP. Called once, after every channel has
+   been read. */
+static void brute_finalize(IdsConfig *cfg, ScanReport *rep, EvidenceTable *tbl) {
+    for (int i = 0; i < g_brute_n; i++) {
+        BruteEntry *e = &g_brute[i];
+        if (e->n < BRUTE_THRESHOLD) continue;
+
+        qsort(e->hits, (size_t)e->n, sizeof(time_t), cmp_time);
+
+        int    best = 0;
+        time_t best_from = 0, best_to = 0;
+        for (int hi = 0, lo = 0; hi < e->n; hi++) {
+            while (e->hits[hi] - e->hits[lo] > BRUTE_WINDOW_SECS) lo++;
+            int cnt = hi - lo + 1;
+            if (cnt > best) {
+                best = cnt;
+                best_from = e->hits[lo];
+                best_to   = e->hits[hi];
+            }
+        }
+        if (best < BRUTE_THRESHOLD) continue;
+
+        char from_s[32], to_s[32];
+        ids_timestamp_str(best_from, from_s, sizeof(from_s));
+        ids_timestamp_str(best_to,   to_s,   sizeof(to_s));
+
+        Alert a = {0};
+        a.type      = ALERT_BRUTE_FORCE;
+        a.severity  = SEV_HIGH;
+        a.timestamp = best_to;
+        strncpy(a.source_ip, e->ip, MAX_IP_LEN - 1);
+        strncpy(a.technique_id, "T1110", sizeof(a.technique_id) - 1);
+        snprintf(a.description, MAX_DESCRIPTION,
+                 "Brute-force: %d failed logons within %ds from %s "
+                 "(peak %s -> %s, user=%s, %d total in window%s)",
+                 best, BRUTE_WINDOW_SECS, e->ip, from_s, to_s,
+                 e->user[0] ? e->user : "?", e->n,
+                 e->dropped ? ", truncated" : "");
+
+        report_add(rep, &a);
+        ids_log_alert(cfg, &a);
+        if (tbl) report_table_add(tbl, e->ip, "brute-force", "EventID 4625",
+                                  ENTRY_FLAGGED, a.description);
+    }
 }
 
 /* -----------------------------------------------
@@ -141,9 +257,14 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
         xml_extract_data(xml, "SubjectUserName", username, sizeof(username));
     xml_extract_data(xml, "NewProcessName", proc_name, sizeof(proc_name));
 
+    /* Stamp the alert with the record's own creation time. Stamping it with
+       the scan time made every finding from a 24h lookback appear to have
+       happened at the moment of the scan. */
+    time_t evt_time = xml_event_time(xml);
+
     Alert a = {0};
     a.type      = ALERT_SUSPICIOUS_EVENT;
-    a.timestamp = time(NULL);
+    a.timestamp = evt_time ? evt_time : time(NULL);
     strncpy(a.source_ip, src_ip, MAX_IP_LEN - 1);
 
     char ev_label[64];
@@ -151,30 +272,12 @@ static void process_event(IdsConfig *cfg, ScanReport *rep,
 
     switch (eid) {
 
-        case EVT_LOGON_FAILURE: {
-            const char *src = src_ip[0] ? src_ip : "local";
-            BruteEntry *b   = brute_get(src);
-            if (!b) break;
-
-            if (time(NULL) - b->first > BRUTE_WINDOW_SECS) {
-                b->count = 1; b->first = time(NULL);
-            } else {
-                b->count++;
-                if (b->count >= BRUTE_THRESHOLD) {
-                    a.type     = ALERT_BRUTE_FORCE;
-                    a.severity = SEV_HIGH;
-                    snprintf(a.description, MAX_DESCRIPTION,
-                             "Brute-force: %lu failed logons in %ds from %s (user=%s)",
-                             b->count, BRUTE_WINDOW_SECS, src,
-                             username[0] ? username : "?");
-                    b->count = 0; b->first = time(NULL);
-                    report_add(rep, &a); ids_log_alert(cfg, &a);
-                    report_table_add(tbl, src_ip, "brute-force", ev_label,
-                                     ENTRY_FLAGGED, a.description);
-                }
-            }
-            return; /* don't emit individual 4625 unless brute threshold hit */
-        }
+        case EVT_LOGON_FAILURE:
+            /* Record only. The window is evaluated in brute_finalize() once
+               every channel has been read, because records arrive
+               newest-first and a single 4625 is not itself an alert. */
+            brute_note(src_ip[0] ? src_ip : "local", username, a.timestamp);
+            return;
 
         case EVT_ACCOUNT_LOCKOUT: {
             char locked[128] = {0};
@@ -339,11 +442,16 @@ void ids_scan_events(IdsConfig *cfg, ScanReport *rep) {
 
     EvidenceTable *tbl = report_table_begin(rep, "events");
 
+    g_brute_n = 0;
+
     query_channel(cfg, rep, tbl, L"Security", hours);
     query_channel(cfg, rep, tbl, L"System", hours);
     query_channel(cfg, rep, tbl,
                   L"Microsoft-Windows-Windows Defender/Operational", hours);
 
+    /* All 4625 records are in; now evaluate the real time window. */
+    brute_finalize(cfg, rep, tbl);
+
     LOG_INFO("scan: events -- done  processed=%d  flagged=%d",
-             tbl->count, tbl->flagged_count);
+             tbl ? tbl->count : 0, tbl ? tbl->flagged_count : 0);
 }
