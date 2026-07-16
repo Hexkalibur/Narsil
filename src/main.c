@@ -136,13 +136,29 @@ int main(int argc, char *argv[]) {
         LOG_INFO("config loaded: %s", conf_file);
     }
 
+    /* The -v switch and the 'verbose' config directive are equivalent: either
+       one enables debug output. The config parser writes cfg->verbose, the
+       argument loop writes g_verbose, and LOG_DBG() only ever reads g_verbose
+       -- merge both into g_verbose so neither source is silently discarded. */
+    if (cfg->verbose) g_verbose = TRUE;
     cfg->verbose = g_verbose;
 
-    /* Derive JSONL path from report path */
+    /* Derive the JSONL path from the report path. Only the extension of the
+       file name is replaced: strrchr() over the whole path would match a dot
+       inside a directory component (e.g. "C:\logs.old\report") and truncate
+       the path there. */
     char jsonl[MAX_LOG_PATH];
     strncpy(jsonl, report_path, MAX_LOG_PATH - 1);
-    char *dot = strrchr(jsonl, '.');
-    if (dot) snprintf(dot,  MAX_LOG_PATH - (int)(dot - jsonl), ".jsonl");
+    jsonl[MAX_LOG_PATH - 1] = '\0';   /* strncpy() does not terminate on truncation */
+
+    char *bs   = strrchr(jsonl, '\\');
+    char *fs   = strrchr(jsonl, '/');
+    char *base = bs;
+    if (!base || (fs && fs > base)) base = fs;
+    base = base ? base + 1 : jsonl;
+
+    char *dot = strrchr(base, '.');
+    if (dot) snprintf(dot,  MAX_LOG_PATH - (size_t)(dot - jsonl), ".jsonl");
     else     strncat(jsonl, ".jsonl", MAX_LOG_PATH - strlen(jsonl) - 1);
 
     ScanReport *rep = report_create(report_path, jsonl);
